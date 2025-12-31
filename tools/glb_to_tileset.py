@@ -457,6 +457,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("input_glb", type=Path, help="Input .glb file")
     parser.add_argument("output_dir", type=Path, help="Output directory to write tileset.json (and copy .glb)")
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("out"),
+        help="Base output directory (default: out). Use '.' to keep legacy paths.",
+    )
 
     parser.add_argument("--out-glb", dest="out_glb", default=None, help="Output GLB filename inside output_dir (default: input basename)")
     parser.add_argument("--no-copy", action="store_true", help="Do not copy GLB into output_dir (tileset.json will still reference --out-glb)")
@@ -468,7 +474,12 @@ def parse_args() -> argparse.Namespace:
         help="Clamp each half-extent to at least this many meters to avoid degenerate boxes (default: 0)",
     )
     parser.add_argument("--refine", default="REPLACE", choices=["REPLACE", "ADD"], help="Tile refine mode (default: REPLACE)")
-    parser.add_argument("--geometric-error", type=_finite_number, default=0.0, help="root.geometricError in meters (default: 0)")
+    parser.add_argument(
+        "--geometric-error",
+        type=_finite_number,
+        default=None,
+        help="root.geometricError in meters (default: auto from bounding box)",
+    )
     parser.add_argument(
         "--tileset-geometric-error",
         type=_finite_number,
@@ -480,11 +491,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_output_dir(output_dir: Path, output_root: Path | None) -> Path:
+    if output_root is None or output_dir.is_absolute():
+        return output_dir
+    return output_root / output_dir
+
+
 def main() -> int:
     args = parse_args()
 
     input_glb: Path = args.input_glb
-    output_dir: Path = args.output_dir
+    output_dir: Path = _resolve_output_dir(args.output_dir, args.output_root)
 
     if not input_glb.is_file():
         raise GlbError(f"Input not found: {input_glb}")
@@ -497,17 +514,27 @@ def main() -> int:
 
     gltf, bin_chunk = read_glb(input_glb)
     aabb = compute_gltf_scene_aabb(gltf, bin_chunk).expand(args.padding)
+    _, half_extents = aabb.center_and_half_extents(min_half_extent=args.min_half_extent)
+    default_geometric_error = math.sqrt(
+        half_extents[0] * half_extents[0]
+        + half_extents[1] * half_extents[1]
+        + half_extents[2] * half_extents[2]
+    )
+    if default_geometric_error <= 0.0:
+        default_geometric_error = 1.0
+
+    geometric_error = args.geometric_error if args.geometric_error is not None else default_geometric_error
 
     tileset_geometric_error = args.tileset_geometric_error
     if tileset_geometric_error is None:
-        tileset_geometric_error = args.geometric_error
+        tileset_geometric_error = geometric_error
 
     tileset = {
         "asset": {"version": args.asset_version},
         "geometricError": tileset_geometric_error,
         "root": {
             "boundingVolume": {"box": aabb_to_tileset_box(aabb, min_half_extent=args.min_half_extent)},
-            "geometricError": args.geometric_error,
+            "geometricError": geometric_error,
             "refine": args.refine,
             "content": {"uri": content_uri},
         },

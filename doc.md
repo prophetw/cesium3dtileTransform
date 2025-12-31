@@ -15,9 +15,12 @@
 
 ```bash
 python3 tools/glb_to_tileset.py path/to/model.glb out_tiles/
-python3 -m http.server 8000 --directory out_tiles
+python3 -m http.server 8000 --directory out/out_tiles
+
+npx serve -l 9981 -C
 ```
 
+默认会把输出放到 `out/` 下，例如 `out/out_tiles/tileset.json`。如需保持旧路径可加 `--output-root .`。
 然后在客户端加载 `http://localhost:8000/tileset.json`。
 
 一句话概括本项目：**把一个 3D 模型“切成一棵可流式加载的空间层级树（BVH）”，再用 `tileset.json` 把这棵树描述出来；LOD（细节层级）就是这棵树的“父粗子细” + `geometricError` 驱动的细化策略。**
@@ -117,7 +120,7 @@ glTF 顶点是 float32，直接把顶点写成 ECEF（几百万米量级）会�
 仓库提供 `tools/update_transform.py`，用 `georef.json` 写入 `root.transform`：
 
 ```bash
-python3 tools/update_transform.py out_tiles/tileset.json georef.example.json --pretty
+python3 tools/update_transform.py out/out_tiles/tileset.json georef.example.json --pretty
 ```
 
 `georef.json` 最小字段：

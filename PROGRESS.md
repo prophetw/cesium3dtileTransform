@@ -19,7 +19,9 @@ V1 已完成并验证；V3（quadtree 切块 + 采样 LOD）进入可用试验�
 - `georef.json` → `root.transform` 写入工具
 - quadtree 切块（按节点 AABB 中心点）
 - root 级采样 LOD（按三角形均匀采样）
+- 采样 LOD 顶点缓冲重建（剔除未引用顶点）
 - 子 tiles GLB 子集导出（按节点集合）
+- 共享外部纹理导出（可选，避免每个 GLB 重复内嵌纹理）
 
 ## 进行中
 

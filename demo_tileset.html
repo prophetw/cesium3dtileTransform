@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tileset Demo</title>
+    <script>
+      window.CESIUM_BASE_URL = "./CesiumV133/Build/Cesium/";
+    </script>
+    <script src="./CesiumV133/Build/Cesium/Cesium.js"></script>
+    <link
+      href="./CesiumV133/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #0b0f14;
+      }
+      #toolbar {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        z-index: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        align-items: flex-start;
+        max-width: 620px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: rgba(12, 16, 22, 0.8);
+        color: #e6edf3;
+        font: 12px/1.2 "Helvetica Neue", Arial, sans-serif;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+      }
+      label {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+      input,
+      select {
+        background: rgba(230, 237, 243, 0.08);
+        color: #e6edf3;
+        border: 1px solid rgba(230, 237, 243, 0.3);
+        border-radius: 6px;
+        padding: 2px 6px;
+        min-width: 80px;
+      }
+      #status {
+        padding-right: 6px;
+        opacity: 0.9;
+      }
+      button {
+        border: 1px solid rgba(230, 237, 243, 0.3);
+        background: rgba(230, 237, 243, 0.08);
+        color: #e6edf3;
+        padding: 4px 8px;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: rgba(230, 237, 243, 0.16);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="cesiumContainer"></div>
+    <div id="toolbar">
+      <div class="row">
+        <span id="status">Loading...</span>
+        <button id="reload">Reload Tileset</button>
+        <button id="toggleGlobe">Toggle Globe</button>
+      </div>
+      <div class="row">
+        <label>Base <input id="baseDir" type="text" value="out/" /></label>
+        <label>
+          Tileset
+          <select id="tilesetSelect">
+            <option value="out_tiles_test">out_tiles_test</option>
+            <option value="out_tiles_quadtree_test">out_tiles_quadtree_test</option>
+            <option value="out_tiles_quadtree_test_rebuild">
+              out_tiles_quadtree_test_rebuild
+            </option>
+            <option value="out_tiles_quadtree_test_sharedtex">
+              out_tiles_quadtree_test_sharedtex
+            </option>
+          </select>
+        </label>
+        <button id="loadTileset">Load Selected</button>
+      </div>
+      <div class="row">
+        <label>Lon <input id="lon" type="number" step="0.000001" /></label>
+        <label>Lat <input id="lat" type="number" step="0.000001" /></label>
+        <label>H <input id="height" type="number" step="0.01" /></label>
+      </div>
+      <div class="row">
+        <label>Heading <input id="heading" type="number" step="0.1" /></label>
+        <label>Pitch <input id="pitch" type="number" step="0.1" /></label>
+        <label>Roll <input id="roll" type="number" step="0.1" /></label>
+      </div>
+      <div class="row">
+        <label>
+          Axis
+          <select id="axis">
+            <option value="Z_UP">Z_UP</option>
+            <option value="Y_UP">Y_UP</option>
+          </select>
+        </label>
+        <label>
+          Unit
+          <select id="unit">
+            <option value="m">m</option>
+            <option value="cm">cm</option>
+            <option value="mm">mm</option>
+            <option value="ft">ft</option>
+            <option value="in">in</option>
+          </select>
+        </label>
+        <label>Scale <input id="scale" type="number" step="0.0001" /></label>
+      </div>
+      <div class="row">
+        <button id="applyGeoref">Apply Georef</button>
+        <button id="resetGeoref">Reset Transform</button>
+      </div>
+    </div>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const baseDirEl = document.getElementById("baseDir");
+      const tilesetSelectEl = document.getElementById("tilesetSelect");
+      const defaultGeoref = {
+        mode: "enu",
+        origin: [116.3913, 39.9075, 35.0],
+        heading: 0.0,
+        pitch: 0.0,
+        roll: 0.0,
+        axis: "Z_UP",
+        unit: "m",
+        scale: 1.0,
+      };
+      const viewer = new Cesium.Viewer("cesiumContainer", {
+        animation: false,
+        timeline: false,
+        geocoder: false,
+        baseLayerPicker: false,
+        homeButton: false,
+        navigationHelpButton: false,
+        sceneModePicker: false,
+        selectionIndicator: false,
+        infoBox: false,
+        terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+        imageryProvider: new Cesium.GridImageryProvider(),
+      });
+
+      let tileset;
+      let rootTransform = new Cesium.Matrix4();
+      let invRootTransform = new Cesium.Matrix4();
+
+      function getTilesetUrl() {
+        const base = baseDirEl.value.trim();
+        const prefix = base === "" ? "" : base.endsWith("/") ? base : `${base}/`;
+        return `${prefix}${tilesetSelectEl.value}/tileset.json`;
+      }
+
+      function setInputs(cfg) {
+        document.getElementById("lon").value = cfg.origin[0];
+        document.getElementById("lat").value = cfg.origin[1];
+        document.getElementById("height").value = cfg.origin[2];
+        document.getElementById("heading").value = cfg.heading;
+        document.getElementById("pitch").value = cfg.pitch;
+        document.getElementById("roll").value = cfg.roll;
+        document.getElementById("axis").value = cfg.axis;
+        document.getElementById("unit").value = cfg.unit;
+        document.getElementById("scale").value = cfg.scale;
+      }
+
+      function getNumber(id, label) {
+        const el = document.getElementById(id);
+        const raw = el.value.trim();
+        if (raw === "") {
+          throw new Error(`${label} is required`);
+        }
+        const value = Number(raw);
+        if (!Number.isFinite(value)) {
+          throw new Error(`${label} must be a number`);
+        }
+        return value;
+      }
+
+      function readGeorefInputs() {
+        const unit = document.getElementById("unit").value;
+        const axis = document.getElementById("axis").value;
+        return {
+          mode: "enu",
+          origin: [
+            getNumber("lon", "Lon"),
+            getNumber("lat", "Lat"),
+            getNumber("height", "Height"),
+          ],
+          heading: getNumber("heading", "Heading"),
+          pitch: getNumber("pitch", "Pitch"),
+          roll: getNumber("roll", "Roll"),
+          axis,
+          unit,
+          scale: getNumber("scale", "Scale"),
+        };
+      }
+
+      function unitScale(unit) {
+        const table = {
+          m: 1.0,
+          meter: 1.0,
+          meters: 1.0,
+          cm: 0.01,
+          centimeter: 0.01,
+          centimeters: 0.01,
+          mm: 0.001,
+          millimeter: 0.001,
+          millimeters: 0.001,
+          ft: 0.3048,
+          foot: 0.3048,
+          feet: 0.3048,
+          in: 0.0254,
+          inch: 0.0254,
+          inches: 0.0254,
+        };
+        if (!(unit in table)) {
+          throw new Error(`Unsupported unit: ${unit}`);
+        }
+        return table[unit];
+      }
+
+      function buildTransform(cfg) {
+        const scale = unitScale(cfg.unit) * cfg.scale;
+        const scaleMat = Cesium.Matrix4.fromScale(
+          new Cesium.Cartesian3(scale, scale, scale),
+          new Cesium.Matrix4()
+        );
+
+        let axisMat = new Cesium.Matrix4();
+        if (cfg.axis === "Z_UP") {
+          Cesium.Matrix4.clone(Cesium.Matrix4.IDENTITY, axisMat);
+        } else if (cfg.axis === "Y_UP") {
+          const rot = Cesium.Matrix3.fromRotationX(
+            Cesium.Math.toRadians(90.0)
+          );
+          axisMat = Cesium.Matrix4.fromRotationTranslation(
+            rot,
+            Cesium.Cartesian3.ZERO,
+            new Cesium.Matrix4()
+          );
+        } else {
+          throw new Error(`Unsupported axis: ${cfg.axis}`);
+        }
+
+        const h = Cesium.Math.toRadians(cfg.heading);
+        const p = Cesium.Math.toRadians(cfg.pitch);
+        const r = Cesium.Math.toRadians(cfg.roll);
+        const hMat = Cesium.Matrix3.fromRotationZ(h);
+        const pMat = Cesium.Matrix3.fromRotationY(p);
+        const rMat = Cesium.Matrix3.fromRotationX(r);
+        const hpMat = Cesium.Matrix3.multiply(
+          hMat,
+          pMat,
+          new Cesium.Matrix3()
+        );
+        const hprMat3 = Cesium.Matrix3.multiply(
+          hpMat,
+          rMat,
+          new Cesium.Matrix3()
+        );
+        const hprMat = Cesium.Matrix4.fromRotationTranslation(
+          hprMat3,
+          Cesium.Cartesian3.ZERO,
+          new Cesium.Matrix4()
+        );
+
+        const axisScale = Cesium.Matrix4.multiply(
+          axisMat,
+          scaleMat,
+          new Cesium.Matrix4()
+        );
+        const localToEnu = Cesium.Matrix4.multiply(
+          hprMat,
+          axisScale,
+          new Cesium.Matrix4()
+        );
+
+        const origin = Cesium.Cartesian3.fromDegrees(
+          cfg.origin[0],
+          cfg.origin[1],
+          cfg.origin[2]
+        );
+        const ecefFromEnu = Cesium.Transforms.eastNorthUpToFixedFrame(origin);
+        return Cesium.Matrix4.multiply(
+          ecefFromEnu,
+          localToEnu,
+          new Cesium.Matrix4()
+        );
+      }
+
+      function cacheRootTransform() {
+        if (tileset && tileset.root && tileset.root.transform) {
+          Cesium.Matrix4.clone(tileset.root.transform, rootTransform);
+        } else {
+          Cesium.Matrix4.clone(Cesium.Matrix4.IDENTITY, rootTransform);
+        }
+        Cesium.Matrix4.inverse(rootTransform, invRootTransform);
+      }
+
+      function applyGeoref(cfg) {
+        if (!tileset) {
+          throw new Error("Tileset not loaded");
+        }
+        const target = buildTransform(cfg);
+        const modelMatrix = Cesium.Matrix4.multiply(
+          target,
+          invRootTransform,
+          new Cesium.Matrix4()
+        );
+        tileset.modelMatrix = modelMatrix;
+        viewer.zoomTo(tileset);
+        statusEl.textContent = "Transform applied";
+      }
+
+      async function loadTileset() {
+        if (tileset) {
+          viewer.scene.primitives.remove(tileset);
+        }
+        const tilesetUrl = getTilesetUrl();
+        statusEl.textContent = `Loading ${tilesetUrl}`;
+        tileset = await Cesium.Cesium3DTileset.fromUrl(tilesetUrl);
+        viewer.scene.primitives.add(tileset);
+        cacheRootTransform();
+        await viewer.zoomTo(tileset);
+        statusEl.textContent = "Loaded";
+      }
+
+      document.getElementById("reload").addEventListener("click", () => {
+        loadTileset().catch(handleError);
+      });
+
+      document.getElementById("toggleGlobe").addEventListener("click", () => {
+        viewer.scene.globe.show = !viewer.scene.globe.show;
+      });
+
+      document.getElementById("loadTileset").addEventListener("click", () => {
+        loadTileset().catch(handleError);
+      });
+
+      document.getElementById("applyGeoref").addEventListener("click", () => {
+        try {
+          const cfg = readGeorefInputs();
+          applyGeoref(cfg);
+        } catch (err) {
+          handleError(err);
+        }
+      });
+
+      document.getElementById("resetGeoref").addEventListener("click", () => {
+        if (!tileset) {
+          return;
+        }
+        tileset.modelMatrix = Cesium.Matrix4.IDENTITY;
+        viewer.zoomTo(tileset);
+        statusEl.textContent = "Reset to tileset transform";
+      });
+
+      function handleError(err) {
+        console.error(err);
+        statusEl.textContent = String(err);
+      }
+
+      setInputs(defaultGeoref);
+      loadTileset().catch(handleError);
+    </script>
+  </body>
+</html>

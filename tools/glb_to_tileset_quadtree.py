@@ -20,10 +20,33 @@ CHUNK_TYPE_BIN = 0x004E4942  # b"BIN\0"
 
 TRIANGLES_MODE = 4
 
+TARGET_ARRAY_BUFFER = 34962
+TARGET_ELEMENT_ARRAY_BUFFER = 34963
+
+COMPONENT_TYPE_INT8 = 5120
 COMPONENT_TYPE_UINT8 = 5121
+COMPONENT_TYPE_INT16 = 5122
 COMPONENT_TYPE_UINT16 = 5123
 COMPONENT_TYPE_UINT32 = 5125
 COMPONENT_TYPE_FLOAT32 = 5126
+
+IMAGE_MIME_TO_EXT: dict[str, str] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/ktx2": ".ktx2",
+}
+
+COMPONENT_TYPE_BYTE_SIZE: dict[int, int] = {
+    COMPONENT_TYPE_INT8: 1,
+    COMPONENT_TYPE_UINT8: 1,
+    COMPONENT_TYPE_INT16: 2,
+    COMPONENT_TYPE_UINT16: 2,
+    COMPONENT_TYPE_UINT32: 4,
+    COMPONENT_TYPE_FLOAT32: 4,
+}
 
 INDEX_COMPONENT_TYPES: dict[int, tuple[str, int]] = {
     COMPONENT_TYPE_UINT8: ("B", 1),
@@ -113,6 +136,13 @@ class NodeInfo:
     aabb: Aabb
     triangle_count: int
     center_xy: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class NewAccessorBlob:
+    accessor: dict[str, Any]
+    data: bytes
+    target: int | None
 
 
 @dataclass
@@ -478,6 +508,176 @@ def _choose_index_component_type(max_index: int) -> int:
     return COMPONENT_TYPE_UINT32
 
 
+def _accessor_element_size(accessor: dict[str, Any]) -> int:
+    component_type = accessor.get("componentType")
+    if not isinstance(component_type, int):
+        raise GlbError("Accessor.componentType missing")
+    component_size = COMPONENT_TYPE_BYTE_SIZE.get(component_type)
+    if component_size is None:
+        raise GlbError(f"Unsupported accessor.componentType: {component_type}")
+    type_name = accessor.get("type")
+    if type_name not in TYPE_COMPONENT_COUNT:
+        raise GlbError(f"Unsupported accessor.type: {type_name}")
+    return TYPE_COMPONENT_COUNT[type_name] * component_size
+
+
+def _extract_accessor_elements_bytes(
+    *,
+    accessor_index: int,
+    element_indices: list[int],
+    gltf: dict[str, Any],
+    bin_chunk: bytes,
+) -> bytes:
+    accessors = gltf.get("accessors", [])
+    buffer_views = gltf.get("bufferViews", [])
+
+    if not element_indices:
+        return b""
+    if not (0 <= accessor_index < len(accessors)):
+        raise GlbError(f"Accessor index out of range: {accessor_index}")
+    accessor = accessors[accessor_index]
+    if "sparse" in accessor:
+        raise GlbError("Sparse accessors are not supported in V3")
+
+    count = accessor.get("count")
+    if not isinstance(count, int) or count < 0:
+        raise GlbError("Invalid accessor.count")
+    max_index = max(element_indices)
+    if max_index >= count:
+        raise GlbError("Accessor element index out of range")
+
+    buffer_view_index = accessor.get("bufferView")
+    if not isinstance(buffer_view_index, int):
+        raise GlbError("Accessor.bufferView missing")
+    if not (0 <= buffer_view_index < len(buffer_views)):
+        raise GlbError(f"bufferView index out of range: {buffer_view_index}")
+    buffer_view = buffer_views[buffer_view_index]
+
+    buffer_index = buffer_view.get("buffer", 0)
+    if buffer_index != 0:
+        raise GlbError("Only buffer 0 (GLB BIN chunk) is supported in V3")
+
+    element_size = _accessor_element_size(accessor)
+    stride = buffer_view.get("byteStride", element_size)
+    if not isinstance(stride, int) or stride < element_size:
+        raise GlbError("Invalid bufferView.byteStride for accessor")
+
+    base_offset = int(buffer_view.get("byteOffset", 0)) + int(accessor.get("byteOffset", 0))
+    total_bytes_needed = base_offset + max_index * stride + element_size
+    if total_bytes_needed > len(bin_chunk):
+        raise GlbError("Accessor points outside BIN chunk")
+
+    out = bytearray()
+    for element_index in element_indices:
+        offset = base_offset + element_index * stride
+        out.extend(bin_chunk[offset : offset + element_size])
+    return bytes(out)
+
+
+def _vec3_f32_min_max(data: bytes) -> tuple[list[float], list[float]]:
+    if len(data) % 12 != 0:
+        raise GlbError("Invalid VEC3 float32 buffer length")
+    min_x = min_y = min_z = float("inf")
+    max_x = max_y = max_z = -float("inf")
+    for offset in range(0, len(data), 12):
+        x, y, z = struct.unpack_from("<fff", data, offset)
+        min_x = min(min_x, x)
+        min_y = min(min_y, y)
+        min_z = min(min_z, z)
+        max_x = max(max_x, x)
+        max_y = max(max_y, y)
+        max_z = max(max_z, z)
+    return [min_x, min_y, min_z], [max_x, max_y, max_z]
+
+
+def _compact_vertex_indices(indices: list[int]) -> tuple[list[int], list[int]]:
+    vertex_indices: list[int] = []
+    remap: dict[int, int] = {}
+    remapped: list[int] = []
+    for idx in indices:
+        new_idx = remap.get(idx)
+        if new_idx is None:
+            new_idx = len(vertex_indices)
+            remap[idx] = new_idx
+            vertex_indices.append(idx)
+        remapped.append(new_idx)
+    return vertex_indices, remapped
+
+
+def _sniff_image_ext(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return ".gif"
+    if data.startswith(b"\xabKTX 20\xbb\r\n\x1a\n"):
+        return ".ktx2"
+    return ".bin"
+
+
+def _sanitize_filename(value: str) -> str:
+    keep: list[str] = []
+    for ch in value.strip():
+        if ch.isalnum() or ch in ("-", "_", "."):
+            keep.append(ch)
+        elif ch.isspace():
+            keep.append("_")
+    out = "".join(keep).strip("._")
+    return out[:64] if out else ""
+
+
+def extract_glb_images(
+    gltf: dict[str, Any],
+    bin_chunk: bytes,
+    *,
+    out_dir: Path,
+    uri_prefix: str,
+) -> dict[int, str]:
+    images = gltf.get("images", [])
+    buffer_views = gltf.get("bufferViews", [])
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mapping: dict[int, str] = {}
+
+    for image_index, image in enumerate(images):
+        if not isinstance(image, dict):
+            raise GlbError("Invalid glTF image entry")
+        if "uri" in image:
+            continue
+        buffer_view_index = image.get("bufferView")
+        if buffer_view_index is None:
+            continue
+        if not isinstance(buffer_view_index, int) or not (0 <= buffer_view_index < len(buffer_views)):
+            raise GlbError("Invalid image.bufferView")
+        buffer_view = buffer_views[buffer_view_index]
+        if buffer_view.get("buffer", 0) != 0:
+            raise GlbError("Only buffer 0 (GLB BIN chunk) is supported in V3")
+
+        byte_offset = int(buffer_view.get("byteOffset", 0))
+        byte_length = int(buffer_view.get("byteLength", 0))
+        if byte_offset + byte_length > len(bin_chunk):
+            raise GlbError("image bufferView points outside BIN chunk")
+        data = bin_chunk[byte_offset : byte_offset + byte_length]
+
+        mime_type = image.get("mimeType")
+        if isinstance(mime_type, str) and mime_type in IMAGE_MIME_TO_EXT:
+            ext = IMAGE_MIME_TO_EXT[mime_type]
+        else:
+            ext = _sniff_image_ext(data)
+
+        name = ""
+        if isinstance(image.get("name"), str):
+            name = _sanitize_filename(image["name"])
+        filename = f"img_{image_index:03d}{'_' + name if name else ''}{ext}"
+        (out_dir / filename).write_bytes(data)
+        mapping[image_index] = f"{uri_prefix}{filename}"
+
+    return mapping
+
+
 def compute_mesh_aabb(
     *,
     mesh_index: int,
@@ -815,6 +1015,9 @@ def build_subset_glb(
     mesh_nodes: set[int],
     root_nodes: list[int],
     simplify_ratio: float,
+    rebuild_vertices: bool,
+    externalize_textures: bool,
+    external_image_uris: dict[int, str] | None,
 ) -> tuple[dict[str, Any], bytes]:
     if gltf.get("skins"):
         raise GlbError("Skins are not supported in V3")
@@ -868,7 +1071,11 @@ def build_subset_glb(
         new_nodes.append(node)
 
     used_accessors: set[int] = set()
-    new_index_accessors: list[dict[str, Any]] = []
+    new_accessor_blobs: list[NewAccessorBlob] = []
+
+    def add_new_accessor_blob(*, accessor: dict[str, Any], data: bytes, target: int | None) -> tuple[str, int]:
+        new_accessor_blobs.append(NewAccessorBlob(accessor=accessor, data=data, target=target))
+        return ("__new__", len(new_accessor_blobs) - 1)
 
     new_meshes: list[dict[str, Any]] = []
     for mesh_index in mesh_list:
@@ -883,64 +1090,167 @@ def build_subset_glb(
             if "extensions" in primitive and "KHR_draco_mesh_compression" in primitive.get("extensions", {}):
                 raise GlbError("KHR_draco_mesh_compression is not supported in V3")
             new_prim = dict(primitive)
-            attributes = primitive.get("attributes", {})
-            new_attrs: dict[str, int] = {}
-            for name, acc_index in attributes.items():
-                if not isinstance(acc_index, int):
-                    raise GlbError("Invalid attribute accessor index")
-                used_accessors.add(acc_index)
-                new_attrs[name] = acc_index
-            new_prim["attributes"] = new_attrs
-
-            if "targets" in primitive:
-                new_targets = []
-                for target in primitive["targets"]:
-                    new_target: dict[str, int] = {}
-                    for name, acc_index in target.items():
-                        if not isinstance(acc_index, int):
-                            raise GlbError("Invalid target accessor index")
-                        used_accessors.add(acc_index)
-                        new_target[name] = acc_index
-                    new_targets.append(new_target)
-                new_prim["targets"] = new_targets
 
             mode = primitive.get("mode", TRIANGLES_MODE)
             simplify_this = simplify_ratio < 1.0 and mode == TRIANGLES_MODE
+            rebuild_this = rebuild_vertices and simplify_this
+
+            attributes = primitive.get("attributes", {})
+            if not isinstance(attributes, dict) or not attributes:
+                raise GlbError("Primitive.attributes missing/invalid")
+
+            indices: list[int] | None = None
             if simplify_this:
-                indices = None
-                component_type = COMPONENT_TYPE_UINT16
                 if "indices" in primitive:
                     indices_accessor_index = primitive.get("indices")
                     if not isinstance(indices_accessor_index, int):
                         raise GlbError("Invalid indices accessor index")
-                    indices, component_type = _read_indices(
+                    indices, _component_type = _read_indices(
                         accessor_index=indices_accessor_index,
                         gltf=gltf,
                         bin_chunk=bin_chunk,
                     )
                 else:
-                    pos_accessor_index = primitive.get("attributes", {}).get("POSITION")
+                    pos_accessor_index = attributes.get("POSITION")
                     if not isinstance(pos_accessor_index, int):
                         raise GlbError("Primitive has no POSITION for non-indexed triangles")
                     count = accessors[pos_accessor_index].get("count")
                     if not isinstance(count, int) or count <= 0:
                         raise GlbError("Invalid POSITION accessor.count")
                     indices = list(range(count))
-                    component_type = _choose_index_component_type(count - 1)
 
                 if len(indices) < 3:
                     raise GlbError("Triangle primitive has too few indices")
+                indices = indices[: (len(indices) // 3) * 3]
                 sampled = _sample_triangles(indices, simplify_ratio)
-                new_index_accessors.append(
-                    {
+
+                if rebuild_this:
+                    vertex_indices, remapped_indices = _compact_vertex_indices(sampled)
+
+                    new_attrs: dict[str, Any] = {}
+                    for name, acc_index in attributes.items():
+                        if not isinstance(acc_index, int):
+                            raise GlbError("Invalid attribute accessor index")
+                        attr_data = _extract_accessor_elements_bytes(
+                            accessor_index=acc_index,
+                            element_indices=vertex_indices,
+                            gltf=gltf,
+                            bin_chunk=bin_chunk,
+                        )
+                        old_accessor = accessors[acc_index]
+                        new_accessor = {
+                            "componentType": old_accessor.get("componentType"),
+                            "type": old_accessor.get("type"),
+                            "count": len(vertex_indices),
+                        }
+                        if old_accessor.get("normalized"):
+                            new_accessor["normalized"] = True
+                        if name == "POSITION":
+                            if old_accessor.get("componentType") != COMPONENT_TYPE_FLOAT32 or old_accessor.get("type") != "VEC3":
+                                raise GlbError("POSITION must be VEC3 float32 for vertex rebuild")
+                            min_v, max_v = _vec3_f32_min_max(attr_data)
+                            new_accessor["min"] = min_v
+                            new_accessor["max"] = max_v
+                        new_attrs[name] = add_new_accessor_blob(accessor=new_accessor, data=attr_data, target=TARGET_ARRAY_BUFFER)
+                    new_prim["attributes"] = new_attrs
+
+                    if "targets" in primitive:
+                        new_targets: list[dict[str, Any]] = []
+                        for target in primitive["targets"]:
+                            new_target: dict[str, Any] = {}
+                            for name, acc_index in target.items():
+                                if not isinstance(acc_index, int):
+                                    raise GlbError("Invalid target accessor index")
+                                target_data = _extract_accessor_elements_bytes(
+                                    accessor_index=acc_index,
+                                    element_indices=vertex_indices,
+                                    gltf=gltf,
+                                    bin_chunk=bin_chunk,
+                                )
+                                old_accessor = accessors[acc_index]
+                                new_accessor = {
+                                    "componentType": old_accessor.get("componentType"),
+                                    "type": old_accessor.get("type"),
+                                    "count": len(vertex_indices),
+                                }
+                                if old_accessor.get("normalized"):
+                                    new_accessor["normalized"] = True
+                                new_target[name] = add_new_accessor_blob(
+                                    accessor=new_accessor,
+                                    data=target_data,
+                                    target=TARGET_ARRAY_BUFFER,
+                                )
+                            new_targets.append(new_target)
+                        new_prim["targets"] = new_targets
+
+                    max_index = max(remapped_indices) if remapped_indices else 0
+                    component_type = _choose_index_component_type(max_index)
+                    index_accessor = {
+                        "componentType": component_type,
+                        "type": "SCALAR",
+                        "count": len(remapped_indices),
+                    }
+                    index_data = _pack_indices(remapped_indices, component_type)
+                    new_prim["indices"] = add_new_accessor_blob(
+                        accessor=index_accessor,
+                        data=index_data,
+                        target=TARGET_ELEMENT_ARRAY_BUFFER,
+                    )
+                else:
+                    new_attrs = {}
+                    for name, acc_index in attributes.items():
+                        if not isinstance(acc_index, int):
+                            raise GlbError("Invalid attribute accessor index")
+                        used_accessors.add(acc_index)
+                        new_attrs[name] = acc_index
+                    new_prim["attributes"] = new_attrs
+
+                    if "targets" in primitive:
+                        new_targets = []
+                        for target in primitive["targets"]:
+                            new_target: dict[str, int] = {}
+                            for name, acc_index in target.items():
+                                if not isinstance(acc_index, int):
+                                    raise GlbError("Invalid target accessor index")
+                                used_accessors.add(acc_index)
+                                new_target[name] = acc_index
+                            new_targets.append(new_target)
+                        new_prim["targets"] = new_targets
+
+                    max_index = max(sampled) if sampled else 0
+                    component_type = _choose_index_component_type(max_index)
+                    index_accessor = {
                         "componentType": component_type,
                         "type": "SCALAR",
                         "count": len(sampled),
-                        "data": sampled,
                     }
-                )
-                new_prim["indices"] = ("__new__", len(new_index_accessors) - 1)
+                    index_data = _pack_indices(sampled, component_type)
+                    new_prim["indices"] = add_new_accessor_blob(
+                        accessor=index_accessor,
+                        data=index_data,
+                        target=TARGET_ELEMENT_ARRAY_BUFFER,
+                    )
             else:
+                new_attrs = {}
+                for name, acc_index in attributes.items():
+                    if not isinstance(acc_index, int):
+                        raise GlbError("Invalid attribute accessor index")
+                    used_accessors.add(acc_index)
+                    new_attrs[name] = acc_index
+                new_prim["attributes"] = new_attrs
+
+                if "targets" in primitive:
+                    new_targets = []
+                    for target in primitive["targets"]:
+                        new_target: dict[str, int] = {}
+                        for name, acc_index in target.items():
+                            if not isinstance(acc_index, int):
+                                raise GlbError("Invalid target accessor index")
+                            used_accessors.add(acc_index)
+                            new_target[name] = acc_index
+                        new_targets.append(new_target)
+                    new_prim["targets"] = new_targets
+
                 if "indices" in primitive:
                     indices_accessor_index = primitive.get("indices")
                     if not isinstance(indices_accessor_index, int):
@@ -971,13 +1281,14 @@ def build_subset_glb(
         new_accessors.append(accessor)
 
     images = gltf.get("images", [])
-    for image in images:
-        buffer_view_index = image.get("bufferView")
-        if buffer_view_index is None:
-            continue
-        if not isinstance(buffer_view_index, int):
-            raise GlbError("Invalid image.bufferView")
-        used_buffer_views.add(buffer_view_index)
+    if not externalize_textures:
+        for image in images:
+            buffer_view_index = image.get("bufferView")
+            if buffer_view_index is None:
+                continue
+            if not isinstance(buffer_view_index, int):
+                raise GlbError("Invalid image.bufferView")
+            used_buffer_views.add(buffer_view_index)
 
     used_buffer_views_sorted = sorted(used_buffer_views)
     buffer_view_map: dict[int, int] = {}
@@ -1011,61 +1322,73 @@ def build_subset_glb(
         new_buffer_views.append(new_buffer_view)
         buffer_view_map[old_index] = len(new_buffer_views) - 1
 
-    new_index_buffer_views: list[int] = []
-    for entry in new_index_accessors:
-        indices = entry["data"]
-        component_type = entry["componentType"]
-        data = _pack_indices(indices, component_type)
-        new_offset = append_aligned(data)
-        new_buffer_views.append(
-            {
-                "buffer": 0,
-                "byteOffset": new_offset,
-                "byteLength": len(data),
-                "target": 34963,
-            }
-        )
-        new_index_buffer_views.append(len(new_buffer_views) - 1)
+    new_blob_buffer_views: list[int] = []
+    for blob in new_accessor_blobs:
+        new_offset = append_aligned(blob.data)
+        buffer_view: dict[str, Any] = {
+            "buffer": 0,
+            "byteOffset": new_offset,
+            "byteLength": len(blob.data),
+        }
+        if blob.target is not None:
+            buffer_view["target"] = blob.target
+        new_buffer_views.append(buffer_view)
+        new_blob_buffer_views.append(len(new_buffer_views) - 1)
 
     for accessor in new_accessors:
         buffer_view_index = accessor.get("bufferView")
         if buffer_view_index is not None:
             accessor["bufferView"] = buffer_view_map[buffer_view_index]
 
-    for entry, buffer_view_index in zip(new_index_accessors, new_index_buffer_views, strict=True):
-        new_accessors.append(
-            {
-                "bufferView": buffer_view_index,
-                "byteOffset": 0,
-                "componentType": entry["componentType"],
-                "count": entry["count"],
-                "type": entry["type"],
-            }
-        )
+    new_blob_base = len(new_accessors)
+    for blob, buffer_view_index in zip(new_accessor_blobs, new_blob_buffer_views, strict=True):
+        accessor = dict(blob.accessor)
+        accessor["bufferView"] = buffer_view_index
+        accessor["byteOffset"] = 0
+        new_accessors.append(accessor)
 
-    new_index_base = len(new_accessors) - len(new_index_accessors)
     for mesh in new_meshes:
         for prim in mesh["primitives"]:
             attrs = prim.get("attributes", {})
             for name, acc_index in list(attrs.items()):
-                attrs[name] = accessor_map[acc_index]
+                if isinstance(acc_index, tuple) and acc_index[0] == "__new__":
+                    attrs[name] = new_blob_base + acc_index[1]
+                else:
+                    attrs[name] = accessor_map[acc_index]
             if "targets" in prim:
                 for target in prim["targets"]:
                     for name, acc_index in list(target.items()):
-                        target[name] = accessor_map[acc_index]
+                        if isinstance(acc_index, tuple) and acc_index[0] == "__new__":
+                            target[name] = new_blob_base + acc_index[1]
+                        else:
+                            target[name] = accessor_map[acc_index]
             if "indices" in prim:
                 value = prim["indices"]
                 if isinstance(value, tuple) and value[0] == "__new__":
-                    prim["indices"] = new_index_base + value[1]
+                    prim["indices"] = new_blob_base + value[1]
                 else:
                     prim["indices"] = accessor_map[value]
 
     new_images = [dict(image) for image in images]
-    for image in new_images:
-        buffer_view_index = image.get("bufferView")
-        if buffer_view_index is None:
-            continue
-        image["bufferView"] = buffer_view_map[buffer_view_index]
+    if externalize_textures:
+        if external_image_uris is None:
+            external_image_uris = {}
+        for image_index, image in enumerate(new_images):
+            if "uri" in image:
+                continue
+            buffer_view_index = image.get("bufferView")
+            if buffer_view_index is None:
+                continue
+            if image_index not in external_image_uris:
+                raise GlbError("Missing external URI for embedded image")
+            image.pop("bufferView", None)
+            image["uri"] = external_image_uris[image_index]
+    else:
+        for image in new_images:
+            buffer_view_index = image.get("bufferView")
+            if buffer_view_index is None:
+                continue
+            image["bufferView"] = buffer_view_map[buffer_view_index]
 
     new_gltf: dict[str, Any] = {
         "asset": dict(gltf.get("asset", {"version": "2.0"})),
@@ -1110,6 +1433,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("input_glb", type=Path, help="Input .glb file")
     parser.add_argument("output_dir", type=Path, help="Output directory to write tileset.json and tiles")
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("out"),
+        help="Base output directory (default: out). Use '.' to keep legacy paths.",
+    )
 
     parser.add_argument("--max-tris", type=int, default=200_000, help="Max triangles per leaf tile (default: 200000)")
     parser.add_argument("--max-depth", type=int, default=8, help="Max quadtree depth (default: 8)")
@@ -1118,6 +1447,18 @@ def parse_args() -> argparse.Namespace:
         type=_finite_number,
         default=0.15,
         help="Triangle sampling ratio for root LOD (default: 0.15)",
+    )
+    parser.add_argument(
+        "--rebuild-vertices",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Rebuild vertex buffers for simplified primitives to drop unused vertices (default: True)",
+    )
+    parser.add_argument(
+        "--external-textures",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Extract embedded images once and reference them as external files under tiles/textures (default: False)",
     )
     parser.add_argument("--refine", default="REPLACE", choices=["REPLACE", "ADD"], help="Tile refine mode (default: REPLACE)")
     parser.add_argument("--error-factor", type=_finite_number, default=0.1, help="Root geometricError = diagonal * factor (default: 0.1)")
@@ -1137,6 +1478,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asset-version", default="1.1", help="tileset asset.version (default: 1.1)")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON (indent=2)")
     return parser.parse_args()
+
+
+def _resolve_output_dir(output_dir: Path, output_root: Path | None) -> Path:
+    if output_root is None or output_dir.is_absolute():
+        return output_dir
+    return output_root / output_dir
 
 
 def _compute_diagonal(aabb: Aabb) -> float:
@@ -1169,7 +1516,7 @@ def main() -> int:
     args = parse_args()
 
     input_glb: Path = args.input_glb
-    output_dir: Path = args.output_dir
+    output_dir: Path = _resolve_output_dir(args.output_dir, args.output_root)
 
     if not input_glb.is_file():
         raise GlbError(f"Input not found: {input_glb}")
@@ -1186,6 +1533,15 @@ def main() -> int:
 
     gltf, bin_chunk = read_glb(input_glb)
     node_infos, scene_root_nodes, parent_map, scene_nodes = compute_scene_nodes(gltf, bin_chunk)
+
+    external_image_uris: dict[int, str] | None = None
+    if args.external_textures:
+        external_image_uris = extract_glb_images(
+            gltf,
+            bin_chunk,
+            out_dir=tiles_dir / "textures",
+            uri_prefix="textures/",
+        )
 
     world_aabb = Aabb.empty()
     for info in node_infos:
@@ -1220,6 +1576,9 @@ def main() -> int:
             mesh_nodes=mesh_nodes,
             root_nodes=root_nodes,
             simplify_ratio=1.0,
+            rebuild_vertices=False,
+            externalize_textures=args.external_textures,
+            external_image_uris=external_image_uris,
         )
         write_glb(tiles_dir / f"{tile_id}.glb", subset_gltf, subset_bin)
 
@@ -1234,6 +1593,9 @@ def main() -> int:
             mesh_nodes=mesh_nodes,
             root_nodes=root_nodes,
             simplify_ratio=args.simplify_ratio,
+            rebuild_vertices=args.rebuild_vertices,
+            externalize_textures=args.external_textures,
+            external_image_uris=external_image_uris,
         )
         write_glb(output_dir / root_content, subset_gltf, subset_bin)
         root_tile.content_uri = root_content

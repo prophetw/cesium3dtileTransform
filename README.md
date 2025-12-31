@@ -14,15 +14,17 @@
 python3 tools/glb_to_tileset.py path/to/model.glb out_tiles/
 ```
 
+默认会把输出放到 `out/` 下，例如 `out/out_tiles/tileset.json`。如需保持旧路径可加 `--output-root .`。
+
 输出目录：
 
-- `out_tiles/tileset.json`
-- `out_tiles/model.glb`
+- `out/out_tiles/tileset.json`
+- `out/out_tiles/model.glb`
 
 ### 本地验证（静态服务器）
 
 ```bash
-python3 -m http.server 8000 --directory out_tiles
+python3 -m http.server 8000 --directory out/out_tiles
 ```
 
 然后在客户端加载 `http://localhost:8000/tileset.json`。
@@ -40,17 +42,21 @@ python3 tools/glb_to_tileset_quadtree.py path/to/model.glb out_tiles/ \
   --max-tris 200000 --simplify-ratio 0.15 --pretty
 ```
 
+默认会把输出放到 `out/` 下，例如 `out/out_tiles/tileset.json`。如需保持旧路径可加 `--output-root .`。
+
 输出目录：
 
-- `out_tiles/tileset.json`
-- `out_tiles/tiles/root_simplified.glb`（`--simplify-ratio < 1` 时）
-- `out_tiles/tiles/L{depth}_X{x}_Y{y}.glb`
+- `out/out_tiles/tileset.json`
+- `out/out_tiles/tiles/root_simplified.glb`（`--simplify-ratio < 1` 时）
+- `out/out_tiles/tiles/L{depth}_X{x}_Y{y}.glb`
+- `out/out_tiles/tiles/textures/`（`--external-textures` 时，纹理只导出一份供所有 tile 共享）
 
 说明：
 
 - 按节点 AABB 中心点做 quadtree 分块（不切 mesh）
-- LOD 目前只在 root 生成（按三角形均匀采样）
+- LOD 目前只在 root 生成（按三角形均匀采样，默认重建顶点缓冲；可用 `--no-rebuild-vertices` 关闭）
 - 纹理/材质会被拷贝到每个 tile 内（未做共享）
+- 如觉得输出体积过大，可启用 `--external-textures` 避免每个 GLB 内重复内嵌纹理
 
 ## 地理定位（用户输入）
 
@@ -60,7 +66,7 @@ python3 tools/glb_to_tileset_quadtree.py path/to/model.glb out_tiles/ \
 2) 更新 tileset：
 
 ```bash
-python3 tools/update_transform.py out_tiles/tileset.json georef.example.json --pretty
+python3 tools/update_transform.py out/out_tiles/tileset.json georef.example.json --pretty
 ```
 
 `georef.json` 字段说明（最小集）：
@@ -94,7 +100,8 @@ tileset.modelMatrix = Cesium.Transforms.headingPitchRollToFixedFrame(origin, hpr
 
 - 仅支持 `TRIANGLES` primitive
 - 不支持 skin/animation/Draco/sparse accessor
-- 采样简化只减少三角形数量，不重建顶点缓冲
+- 简化为三角形采样（不是 QEM 等真实简化），外观/拓扑不保证最优
+- `--external-textures` 会让 GLB 依赖外部纹理文件（不再是单文件自包含）
 
 ## 文档
 
