@@ -1,14 +1,14 @@
 # 3DTileTransformer 进度文档
 
-更新时间：2024-12-23
+更新时间：2025-12-31
 
 ## 当前进度（阶段性结论）
 
-V1 已完成并验证；V3（quadtree 切块 + 采样 LOD）进入可用试验阶段：
+V1 已完成并验证；V4（多层采样 LOD）进入可用试验阶段：
 
 - V1：单个 `*.glb` → `tileset.json` + 原样 `*.glb`
 - V3：新增 quadtree 切块脚本 `tools/glb_to_tileset_quadtree.py`
-- V3 输出：`tileset.json` + `tiles/` 叶子 tile + `root_simplified.glb`
+- V4 输出：`tileset.json` + `tiles/` 叶子 tile + 内部节点 LOD + `root_simplified.glb`
 - 地理定位：`tools/update_transform.py` 可写入 `root.transform`
 
 ## 已完成
@@ -19,14 +19,17 @@ V1 已完成并验证；V3（quadtree 切块 + 采样 LOD）进入可用试验�
 - `georef.json` → `root.transform` 写入工具
 - quadtree 切块（按节点 AABB 中心点）
 - root 级采样 LOD（按三角形均匀采样）
+- 多层 LOD（内部节点按深度递增的采样比例）
+- meshopt 简化（可选，真实简化）
 - 采样 LOD 顶点缓冲重建（剔除未引用顶点）
 - 子 tiles GLB 子集导出（按节点集合）
 - 共享外部纹理导出（可选，避免每个 GLB 重复内嵌纹理）
+- 超大 leaf tile 的 mesh 切分（按三角形中心拆分）
+- Draco 压缩输出（可选）
+- KTX2 纹理压缩（ETC1S/UASTC，可选）
 
 ## 进行中
 
-- LOD 仅在 root 生成，内部节点无内容
-- 不切 mesh（仅按节点聚类）
 - 纹理/材质在每个 tile 内重复
 
 ## 总体规划（路线图）
@@ -50,8 +53,8 @@ V1 已完成并验证；V3（quadtree 切块 + 采样 LOD）进入可用试验�
 
 ### V4：LOD 生成（父粗子细）
 
-- 已具备：root 采样 LOD（均匀采样）
-- 待增强：多层 LOD、真实简化（QEM/meshopt）
+- 已具备：多层采样 LOD（内部节点输出 LOD）
+- 待增强：QEM 简化
 
 ### V5：隐式瓦片（Implicit Tiling）
 

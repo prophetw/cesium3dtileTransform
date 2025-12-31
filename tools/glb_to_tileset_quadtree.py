@@ -3,10 +3,15 @@ from __future__ import annotations
 
 import argparse
 import array
+import ctypes
 import json
 import math
+import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -156,6 +161,7 @@ class QuadTile:
     children: list["QuadTile"]
     node_indices: list[int] | None
     content_uri: str | None = None
+    primitive_indices: dict[tuple[int, int], list[int]] | None = None
 
     def is_leaf(self) -> bool:
         return not self.children
@@ -332,6 +338,111 @@ def write_glb(glb_path: Path, gltf: dict[str, Any], bin_chunk: bytes) -> None:
     glb_path.write_bytes(header + json_header + json_bytes + bin_header + bin_chunk)
 
 
+def _resolve_draco_tool(tool: str) -> str:
+    if tool == "auto":
+        if shutil.which("gltf-transform"):
+            return "gltf-transform"
+        if shutil.which("gltf-pipeline"):
+            return "gltf-pipeline"
+        raise GlbError("Draco enabled but no tool found. Install gltf-transform or gltf-pipeline.")
+    if tool not in ("gltf-transform", "gltf-pipeline"):
+        raise GlbError(f"Unsupported draco tool: {tool}")
+    if not shutil.which(tool):
+        raise GlbError(f"Draco tool not found on PATH: {tool}")
+    return tool
+
+
+def _compress_glb_draco(glb_path: Path, *, tool: str) -> None:
+    resolved = _resolve_draco_tool(tool)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir) / glb_path.name
+        if resolved == "gltf-transform":
+            cmd = ["gltf-transform", "draco", str(glb_path), str(tmp_path)]
+        else:
+            cmd = ["gltf-pipeline", "-i", str(glb_path), "-o", str(tmp_path), "-d"]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            stderr = proc.stderr.strip() or proc.stdout.strip()
+            raise GlbError(f"Draco compression failed: {' '.join(cmd)} ({stderr})")
+        tmp_path.replace(glb_path)
+
+
+def _compress_glb_ktx2(
+    glb_path: Path,
+    *,
+    mode: str,
+    quality: int | None,
+    rdo_threshold: float | None,
+) -> None:
+    if not shutil.which("gltf-transform"):
+        raise GlbError("KTX2 compression requires gltf-transform CLI on PATH.")
+    if not shutil.which("toktx"):
+        raise GlbError("KTX2 compression requires KTX-Software (toktx) on PATH.")
+
+    env = os.environ.copy()
+    lib_dirs = []
+    for candidate in (
+        Path.home() / ".local" / "lib" / "ktx",
+        Path.home() / ".local" / "lib",
+        Path("/usr/local/lib"),
+        Path("/usr/lib"),
+        Path("/usr/lib/x86_64-linux-gnu"),
+    ):
+        if (candidate / "libktx.so.4").exists() or (candidate / "libktx.so").exists():
+            lib_dirs.append(str(candidate))
+    if lib_dirs:
+        existing = env.get("LD_LIBRARY_PATH", "")
+        extra = ":".join(lib_dirs)
+        env["LD_LIBRARY_PATH"] = f"{extra}:{existing}" if existing else extra
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir) / glb_path.name
+        if mode == "etc1s":
+            cmd = ["gltf-transform", "etc1s", str(glb_path), str(tmp_path)]
+            if quality is not None:
+                cmd += ["--quality", str(quality)]
+            if rdo_threshold is not None:
+                cmd += ["--rdo-threshold", str(rdo_threshold)]
+        elif mode == "uastc":
+            cmd = ["gltf-transform", "uastc", str(glb_path), str(tmp_path)]
+            if quality is not None:
+                cmd += ["--level", str(quality)]
+        else:
+            raise GlbError(f"Unsupported ktx2 mode: {mode}")
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if proc.returncode != 0:
+            stderr = proc.stderr.strip() or proc.stdout.strip()
+            raise GlbError(f"KTX2 compression failed: {' '.join(cmd)} ({stderr})")
+        tmp_path.replace(glb_path)
+
+
+def write_glb_maybe_compress(
+    glb_path: Path,
+    gltf: dict[str, Any],
+    bin_chunk: bytes,
+    *,
+    draco: bool,
+    draco_tool: str,
+    ktx2: bool,
+    ktx2_mode: str,
+    ktx2_quality: int | None,
+    ktx2_rdo_threshold: float | None,
+) -> None:
+    write_glb(glb_path, gltf, bin_chunk)
+    if ktx2:
+        _compress_glb_ktx2(
+            glb_path,
+            mode=ktx2_mode,
+            quality=ktx2_quality,
+            rdo_threshold=ktx2_rdo_threshold,
+        )
+    if draco:
+        if ktx2 and draco_tool == "gltf-pipeline":
+            raise GlbError("Draco with KTX2 requires --draco-tool gltf-transform")
+        _compress_glb_draco(glb_path, tool=draco_tool)
+
+
 def _read_accessor_aabb_from_min_max(accessor: dict[str, Any]) -> Aabb | None:
     if "min" not in accessor or "max" not in accessor:
         return None
@@ -403,6 +514,116 @@ def _read_accessor_vec3_f32_aabb(
         max_z = max(max_z, z)
 
     return Aabb((min_x, min_y, min_z), (max_x, max_y, max_z))
+
+
+def _read_accessor_vec3_f32_array(
+    *,
+    accessor_index: int,
+    gltf: dict[str, Any],
+    bin_chunk: bytes,
+) -> list[float]:
+    accessors = gltf.get("accessors", [])
+    buffer_views = gltf.get("bufferViews", [])
+
+    if not (0 <= accessor_index < len(accessors)):
+        raise GlbError(f"Accessor index out of range: {accessor_index}")
+    accessor = accessors[accessor_index]
+
+    if accessor.get("type") != "VEC3":
+        raise GlbError(f"Unsupported accessor.type for POSITION: {accessor.get('type')} (expected VEC3)")
+    if accessor.get("componentType") != COMPONENT_TYPE_FLOAT32:
+        raise GlbError(
+            f"Unsupported accessor.componentType for POSITION: {accessor.get('componentType')} (expected {COMPONENT_TYPE_FLOAT32})"
+        )
+    if "sparse" in accessor:
+        raise GlbError("Sparse accessors are not supported in V3")
+
+    count = accessor.get("count")
+    if not isinstance(count, int) or count <= 0:
+        raise GlbError("Invalid accessor.count for POSITION")
+
+    buffer_view_index = accessor.get("bufferView")
+    if not isinstance(buffer_view_index, int):
+        raise GlbError("Accessor.bufferView missing for POSITION")
+    if not (0 <= buffer_view_index < len(buffer_views)):
+        raise GlbError(f"bufferView index out of range: {buffer_view_index}")
+    buffer_view = buffer_views[buffer_view_index]
+
+    buffer_index = buffer_view.get("buffer", 0)
+    if buffer_index != 0:
+        raise GlbError("Only buffer 0 (GLB BIN chunk) is supported in V3")
+
+    element_size = TYPE_COMPONENT_COUNT["VEC3"] * 4
+    stride = buffer_view.get("byteStride", element_size)
+    if not isinstance(stride, int) or stride < element_size:
+        raise GlbError("Invalid bufferView.byteStride for POSITION")
+
+    base_offset = int(buffer_view.get("byteOffset", 0)) + int(accessor.get("byteOffset", 0))
+    total_bytes_needed = base_offset + (count - 1) * stride + element_size
+    if total_bytes_needed > len(bin_chunk):
+        raise GlbError("Accessor points outside BIN chunk")
+
+    out: list[float] = []
+    for i in range(count):
+        offset = base_offset + i * stride
+        out.extend(struct.unpack_from("<fff", bin_chunk, offset))
+    return out
+
+
+def _read_accessor_f32_array(
+    *,
+    accessor_index: int,
+    gltf: dict[str, Any],
+    bin_chunk: bytes,
+    allowed_types: set[str],
+) -> tuple[list[float], int, int]:
+    accessors = gltf.get("accessors", [])
+    buffer_views = gltf.get("bufferViews", [])
+
+    if not (0 <= accessor_index < len(accessors)):
+        raise GlbError(f"Accessor index out of range: {accessor_index}")
+    accessor = accessors[accessor_index]
+
+    type_name = accessor.get("type")
+    if type_name not in allowed_types:
+        raise GlbError(f"Unsupported accessor.type: {type_name}")
+    if accessor.get("componentType") != COMPONENT_TYPE_FLOAT32:
+        raise GlbError(f"Unsupported accessor.componentType: {accessor.get('componentType')}")
+    if "sparse" in accessor:
+        raise GlbError("Sparse accessors are not supported in V3")
+
+    count = accessor.get("count")
+    if not isinstance(count, int) or count <= 0:
+        raise GlbError("Invalid accessor.count")
+
+    buffer_view_index = accessor.get("bufferView")
+    if not isinstance(buffer_view_index, int):
+        raise GlbError("Accessor.bufferView missing")
+    if not (0 <= buffer_view_index < len(buffer_views)):
+        raise GlbError(f"bufferView index out of range: {buffer_view_index}")
+    buffer_view = buffer_views[buffer_view_index]
+
+    buffer_index = buffer_view.get("buffer", 0)
+    if buffer_index != 0:
+        raise GlbError("Only buffer 0 (GLB BIN chunk) is supported in V3")
+
+    component_count = TYPE_COMPONENT_COUNT[type_name]
+    element_size = component_count * 4
+    stride = buffer_view.get("byteStride", element_size)
+    if not isinstance(stride, int) or stride < element_size:
+        raise GlbError("Invalid bufferView.byteStride")
+
+    base_offset = int(buffer_view.get("byteOffset", 0)) + int(accessor.get("byteOffset", 0))
+    total_bytes_needed = base_offset + (count - 1) * stride + element_size
+    if total_bytes_needed > len(bin_chunk):
+        raise GlbError("Accessor points outside BIN chunk")
+
+    out: list[float] = []
+    fmt = "<" + "f" * component_count
+    for i in range(count):
+        offset = base_offset + i * stride
+        out.extend(struct.unpack_from(fmt, bin_chunk, offset))
+    return out, component_count, count
 
 
 def _read_indices(
@@ -482,6 +703,174 @@ def _sample_triangles(indices: list[int], ratio: float) -> list[int]:
         start = tri * 3
         out.extend(indices[start : start + 3])
     return out
+
+
+def _meshopt_collect_attributes(
+    *,
+    attributes: dict[str, Any],
+    gltf: dict[str, Any],
+    bin_chunk: bytes,
+    vertex_count: int,
+) -> tuple[list[float], list[float], int] | None:
+    attr_specs = [
+        ("NORMAL", 1.0, {"VEC3"}),
+        ("TEXCOORD_0", 0.5, {"VEC2"}),
+    ]
+    attr_streams: list[tuple[list[float], int, float]] = []
+    for name, weight, allowed_types in attr_specs:
+        acc_index = attributes.get(name)
+        if not isinstance(acc_index, int):
+            continue
+        try:
+            data, component_count, count = _read_accessor_f32_array(
+                accessor_index=acc_index,
+                gltf=gltf,
+                bin_chunk=bin_chunk,
+                allowed_types=allowed_types,
+            )
+        except GlbError:
+            continue
+        if count != vertex_count:
+            continue
+        attr_streams.append((data, component_count, weight))
+
+    if not attr_streams:
+        return None
+
+    attribute_count = sum(component_count for _data, component_count, _weight in attr_streams)
+    weights: list[float] = []
+    for _data, component_count, weight in attr_streams:
+        weights.extend([weight] * component_count)
+
+    out: list[float] = []
+    for i in range(vertex_count):
+        for data, component_count, _weight in attr_streams:
+            start = i * component_count
+            out.extend(data[start : start + component_count])
+
+    return out, weights, attribute_count
+
+
+def _meshopt_simplify_triangles(
+    *,
+    indices: list[int],
+    position_accessor_index: int,
+    attributes: dict[str, Any],
+    gltf: dict[str, Any],
+    bin_chunk: bytes,
+    ratio: float,
+    target_error: float,
+) -> list[int]:
+    triangle_count = len(indices) // 3
+    if triangle_count <= 1 or ratio >= 1.0:
+        return indices
+
+    try:
+        import numpy as np
+        import meshoptimizer
+    except Exception as exc:
+        raise GlbError("meshopt simplification requires numpy + meshoptimizer (pip install meshoptimizer)") from exc
+
+    positions = _read_accessor_vec3_f32_array(
+        accessor_index=position_accessor_index,
+        gltf=gltf,
+        bin_chunk=bin_chunk,
+    )
+    if not positions:
+        raise GlbError("POSITION accessor empty for meshopt simplification")
+    vertex_count = len(positions) // 3
+    if vertex_count <= 0:
+        raise GlbError("POSITION accessor invalid for meshopt simplification")
+
+    target_tris = max(1, int(triangle_count * ratio))
+    target_index_count = target_tris * 3
+
+    indices_np = np.array(indices, dtype=np.uint32)
+    dest = np.empty_like(indices_np)
+    positions_np = np.array(positions, dtype=np.float32)
+
+    attr_payload = _meshopt_collect_attributes(
+        attributes=attributes,
+        gltf=gltf,
+        bin_chunk=bin_chunk,
+        vertex_count=vertex_count,
+    )
+
+    if attr_payload:
+        attr_data, attr_weights, attribute_count = attr_payload
+        attrs_np = np.array(attr_data, dtype=np.float32)
+        weights_np = np.array(attr_weights, dtype=np.float32)
+        try:
+            new_count = meshoptimizer.simplify_with_attributes(
+                dest,
+                indices_np,
+                positions_np,
+                attrs_np,
+                weights_np,
+                index_count=len(indices_np),
+                vertex_count=vertex_count,
+                vertex_positions_stride=12,
+                vertex_attributes_stride=attribute_count * 4,
+                attribute_count=attribute_count,
+                target_index_count=target_index_count,
+                target_error=target_error,
+            )
+        except (AttributeError, TypeError, ctypes.ArgumentError):
+            new_count = meshoptimizer.simplify(
+                dest,
+                indices_np,
+                positions_np,
+                index_count=len(indices_np),
+                vertex_count=vertex_count,
+                vertex_positions_stride=12,
+                target_index_count=target_index_count,
+                target_error=target_error,
+            )
+    else:
+        new_count = meshoptimizer.simplify(
+            dest,
+            indices_np,
+            positions_np,
+            index_count=len(indices_np),
+            vertex_count=vertex_count,
+            vertex_positions_stride=12,
+            target_index_count=target_index_count,
+            target_error=target_error,
+        )
+    if new_count <= 0:
+        raise GlbError("meshopt simplification failed")
+
+    out = dest[:new_count].tolist()
+    out = out[: (len(out) // 3) * 3]
+    if not out or max(out) >= vertex_count:
+        return _sample_triangles(indices, ratio)
+    return out
+
+
+def _simplify_triangles(
+    *,
+    indices: list[int],
+    ratio: float,
+    method: str,
+    position_accessor_index: int,
+    attributes: dict[str, Any],
+    gltf: dict[str, Any],
+    bin_chunk: bytes,
+    target_error: float,
+) -> list[int]:
+    if method == "sample":
+        return _sample_triangles(indices, ratio)
+    if method == "meshopt":
+        return _meshopt_simplify_triangles(
+            indices=indices,
+            position_accessor_index=position_accessor_index,
+            attributes=attributes,
+            gltf=gltf,
+            bin_chunk=bin_chunk,
+            ratio=ratio,
+            target_error=target_error,
+        )
+    raise GlbError(f"Unknown simplify method: {method}")
 
 
 def _pack_indices(indices: list[int], component_type: int) -> bytes:
@@ -771,7 +1160,7 @@ def compute_mesh_triangle_count(
 def compute_scene_nodes(
     gltf: dict[str, Any],
     bin_chunk: bytes,
-) -> tuple[list[NodeInfo], list[int], dict[int, int], set[int]]:
+) -> tuple[list[NodeInfo], list[int], dict[int, int], set[int], dict[int, list[float]]]:
     scenes = gltf.get("scenes", [])
     nodes = gltf.get("nodes", [])
 
@@ -812,12 +1201,14 @@ def compute_scene_nodes(
 
     node_infos: list[NodeInfo] = []
     scene_nodes: set[int] = set()
+    node_world_matrices: dict[int, list[float]] = {}
 
     for root_node_index in root_node_indices:
         if not isinstance(root_node_index, int):
             raise GlbError("Invalid root node index")
         for node_index, node_world_matrix in traverse(root_node_index, _mat4_identity()):
             scene_nodes.add(node_index)
+            node_world_matrices[node_index] = node_world_matrix
             node = nodes[node_index]
             mesh_index = node.get("mesh")
             if mesh_index is None:
@@ -852,7 +1243,7 @@ def compute_scene_nodes(
     if not node_infos:
         raise GlbError("No geometry found in scene (no meshes with POSITION)")
 
-    return node_infos, root_node_indices, parent_map, scene_nodes
+    return node_infos, root_node_indices, parent_map, scene_nodes, node_world_matrices
 
 
 def _tile_bounds_from_aabb(aabb: Aabb) -> tuple[float, float, float, float]:
@@ -988,6 +1379,23 @@ def collect_leaf_tiles(root: QuadTile) -> list[QuadTile]:
     return leaves
 
 
+def collect_subtree_nodes(root: QuadTile) -> dict[tuple[int, int, int], set[int]]:
+    nodes_by_tile: dict[tuple[int, int, int], set[int]] = {}
+
+    def visit(tile: QuadTile) -> set[int]:
+        if tile.is_leaf():
+            nodes = set(tile.node_indices or [])
+        else:
+            nodes = set()
+            for child in tile.children:
+                nodes.update(visit(child))
+        nodes_by_tile[(tile.depth, tile.x, tile.y)] = nodes
+        return nodes
+
+    visit(root)
+    return nodes_by_tile
+
+
 def collect_nodes_with_ancestors(nodes: Iterable[int], parent_map: dict[int, int]) -> set[int]:
     keep = set(nodes)
     for node_index in list(keep):
@@ -1007,6 +1415,227 @@ def collect_root_nodes(nodes: set[int], parent_map: dict[int, int]) -> list[int]
     return sorted(roots)
 
 
+def compute_mesh_usage(gltf: dict[str, Any], scene_nodes: set[int]) -> dict[int, int]:
+    nodes = gltf.get("nodes", [])
+    usage: dict[int, int] = {}
+    for node_index in scene_nodes:
+        if not (0 <= node_index < len(nodes)):
+            continue
+        mesh_index = nodes[node_index].get("mesh")
+        if not isinstance(mesh_index, int):
+            continue
+        usage[mesh_index] = usage.get(mesh_index, 0) + 1
+    return usage
+
+
+def _split_tile_by_triangles(
+    tile: QuadTile,
+    *,
+    gltf: dict[str, Any],
+    bin_chunk: bytes,
+    node_world_matrices: dict[int, list[float]],
+    mesh_usage: dict[int, int],
+    max_tris: int,
+    max_depth: int,
+    position_cache: dict[tuple[int, int], list[tuple[float, float, float]]],
+) -> list[QuadTile] | None:
+    if not tile.node_indices or tile.depth >= max_depth or tile.triangle_count <= max_tris:
+        return None
+
+    nodes = gltf.get("nodes", [])
+    meshes = gltf.get("meshes", [])
+    accessors = gltf.get("accessors", [])
+
+    min_x, min_y, max_x, max_y = tile.bounds_xy
+    mid_x = (min_x + max_x) / 2
+    mid_y = (min_y + max_y) / 2
+
+    child_bounds = [
+        (min_x, min_y, mid_x, mid_y),  # SW
+        (mid_x, min_y, max_x, mid_y),  # SE
+        (min_x, mid_y, mid_x, max_y),  # NW
+        (mid_x, mid_y, max_x, max_y),  # NE
+    ]
+    child_coords = [
+        (tile.x * 2, tile.y * 2),
+        (tile.x * 2 + 1, tile.y * 2),
+        (tile.x * 2, tile.y * 2 + 1),
+        (tile.x * 2 + 1, tile.y * 2 + 1),
+    ]
+
+    child_prims: list[dict[tuple[int, int], list[int]]] = [{}, {}, {}, {}]
+    child_nodes: list[set[int]] = [set(), set(), set(), set()]
+    child_aabbs: list[Aabb] = [Aabb.empty(), Aabb.empty(), Aabb.empty(), Aabb.empty()]
+    child_tri_counts = [0, 0, 0, 0]
+
+    for node_index in tile.node_indices:
+        if not (0 <= node_index < len(nodes)):
+            continue
+        node = nodes[node_index]
+        mesh_index = node.get("mesh")
+        if not isinstance(mesh_index, int):
+            continue
+        if mesh_usage.get(mesh_index, 0) > 1:
+            return None
+        if not (0 <= mesh_index < len(meshes)):
+            raise GlbError(f"Mesh index out of range: {mesh_index}")
+
+        world_matrix = node_world_matrices.get(node_index)
+        if world_matrix is None:
+            raise GlbError("Missing node world matrix for mesh split")
+
+        mesh = meshes[mesh_index]
+        primitives = mesh.get("primitives", [])
+        if not primitives:
+            continue
+
+        for prim_index, primitive in enumerate(primitives):
+            mode = primitive.get("mode", TRIANGLES_MODE)
+            if mode != TRIANGLES_MODE:
+                return None
+            attributes = primitive.get("attributes", {})
+            if not isinstance(attributes, dict):
+                return None
+            pos_accessor_index = attributes.get("POSITION")
+            if not isinstance(pos_accessor_index, int):
+                return None
+
+            cache_key = (node_index, pos_accessor_index)
+            positions_world = position_cache.get(cache_key)
+            if positions_world is None:
+                positions = _read_accessor_vec3_f32_array(
+                    accessor_index=pos_accessor_index,
+                    gltf=gltf,
+                    bin_chunk=bin_chunk,
+                )
+                positions_world = []
+                for i in range(0, len(positions), 3):
+                    p = _mat4_transform_point(
+                        world_matrix,
+                        (positions[i], positions[i + 1], positions[i + 2]),
+                    )
+                    positions_world.append(p)
+                position_cache[cache_key] = positions_world
+
+            if "indices" in primitive:
+                indices_accessor_index = primitive.get("indices")
+                if not isinstance(indices_accessor_index, int):
+                    return None
+                indices, _component_type = _read_indices(
+                    accessor_index=indices_accessor_index,
+                    gltf=gltf,
+                    bin_chunk=bin_chunk,
+                )
+            else:
+                count = accessors[pos_accessor_index].get("count")
+                if not isinstance(count, int) or count <= 0:
+                    return None
+                indices = list(range(count))
+
+            if tile.primitive_indices is not None:
+                subset = tile.primitive_indices.get((mesh_index, prim_index))
+                if subset is None:
+                    continue
+                indices = subset
+
+            if len(indices) < 3:
+                continue
+            indices = indices[: (len(indices) // 3) * 3]
+
+            for i in range(0, len(indices), 3):
+                i0 = indices[i]
+                i1 = indices[i + 1]
+                i2 = indices[i + 2]
+                try:
+                    p0 = positions_world[i0]
+                    p1 = positions_world[i1]
+                    p2 = positions_world[i2]
+                except IndexError:
+                    continue
+
+                cx = (p0[0] + p1[0] + p2[0]) / 3.0
+                cy = (p0[1] + p1[1] + p2[1]) / 3.0
+                east = cx >= mid_x
+                north = cy >= mid_y
+                if not east and not north:
+                    child_idx = 0
+                elif east and not north:
+                    child_idx = 1
+                elif not east and north:
+                    child_idx = 2
+                else:
+                    child_idx = 3
+
+                key = (mesh_index, prim_index)
+                child_prims[child_idx].setdefault(key, []).extend((i0, i1, i2))
+                child_nodes[child_idx].add(node_index)
+                child_tri_counts[child_idx] += 1
+
+                child_aabbs[child_idx] = child_aabbs[child_idx].union(Aabb(p0, p0))
+                child_aabbs[child_idx] = child_aabbs[child_idx].union(Aabb(p1, p1))
+                child_aabbs[child_idx] = child_aabbs[child_idx].union(Aabb(p2, p2))
+
+    children: list[QuadTile] = []
+    for child_idx, bounds_xy, (cx, cy) in zip(range(4), child_bounds, child_coords, strict=True):
+        if child_tri_counts[child_idx] <= 0:
+            continue
+        child_aabb = child_aabbs[child_idx]
+        if child_aabb.is_empty():
+            continue
+        children.append(
+            QuadTile(
+                depth=tile.depth + 1,
+                x=cx,
+                y=cy,
+                bounds_xy=bounds_xy,
+                aabb=child_aabb,
+                triangle_count=child_tri_counts[child_idx],
+                children=[],
+                node_indices=sorted(child_nodes[child_idx]),
+                primitive_indices=child_prims[child_idx] if child_prims[child_idx] else None,
+            )
+        )
+
+    if not children:
+        return None
+    tile.children = children
+    tile.node_indices = None
+    tile.primitive_indices = None
+    tile.triangle_count = sum(child.triangle_count for child in children)
+    return children
+
+
+def split_large_tiles_by_mesh(
+    root: QuadTile,
+    *,
+    gltf: dict[str, Any],
+    bin_chunk: bytes,
+    node_world_matrices: dict[int, list[float]],
+    mesh_usage: dict[int, int],
+    max_tris: int,
+    max_depth: int,
+) -> None:
+    position_cache: dict[tuple[int, int], list[tuple[float, float, float]]] = {}
+    stack = [root]
+    while stack:
+        tile = stack.pop()
+        if tile.is_leaf():
+            children = _split_tile_by_triangles(
+                tile,
+                gltf=gltf,
+                bin_chunk=bin_chunk,
+                node_world_matrices=node_world_matrices,
+                mesh_usage=mesh_usage,
+                max_tris=max_tris,
+                max_depth=max_depth,
+                position_cache=position_cache,
+            )
+            if children:
+                stack.extend(children)
+        else:
+            stack.extend(tile.children)
+
+
 def build_subset_glb(
     gltf: dict[str, Any],
     bin_chunk: bytes,
@@ -1015,7 +1644,10 @@ def build_subset_glb(
     mesh_nodes: set[int],
     root_nodes: list[int],
     simplify_ratio: float,
+    simplify_method: str,
+    simplify_error: float,
     rebuild_vertices: bool,
+    primitive_indices: dict[tuple[int, int], list[int]] | None,
     externalize_textures: bool,
     external_image_uris: dict[int, str] | None,
 ) -> tuple[dict[str, Any], bytes]:
@@ -1039,14 +1671,17 @@ def build_subset_glb(
     node_list = sorted(nodes_to_keep)
     node_map = {old: new for new, old in enumerate(node_list)}
 
-    mesh_set = set()
-    for node_index in sorted(mesh_nodes):
-        mesh_index = nodes[node_index].get("mesh")
-        if mesh_index is None:
-            continue
-        if not isinstance(mesh_index, int):
-            raise GlbError("Invalid node.mesh index")
-        mesh_set.add(mesh_index)
+    if primitive_indices is not None:
+        mesh_set = {mesh_index for (mesh_index, _prim_index), indices in primitive_indices.items() if len(indices) >= 3}
+    else:
+        mesh_set = set()
+        for node_index in sorted(mesh_nodes):
+            mesh_index = nodes[node_index].get("mesh")
+            if mesh_index is None:
+                continue
+            if not isinstance(mesh_index, int):
+                raise GlbError("Invalid node.mesh index")
+            mesh_set.add(mesh_index)
 
     mesh_list = sorted(mesh_set)
     mesh_map = {old: new for new, old in enumerate(mesh_list)}
@@ -1086,150 +1721,146 @@ def build_subset_glb(
 
         new_mesh = dict(mesh)
         new_primitives: list[dict[str, Any]] = []
-        for primitive in primitives:
+        for prim_index, primitive in enumerate(primitives):
             if "extensions" in primitive and "KHR_draco_mesh_compression" in primitive.get("extensions", {}):
                 raise GlbError("KHR_draco_mesh_compression is not supported in V3")
             new_prim = dict(primitive)
 
             mode = primitive.get("mode", TRIANGLES_MODE)
             simplify_this = simplify_ratio < 1.0 and mode == TRIANGLES_MODE
-            rebuild_this = rebuild_vertices and simplify_this
 
             attributes = primitive.get("attributes", {})
             if not isinstance(attributes, dict) or not attributes:
                 raise GlbError("Primitive.attributes missing/invalid")
 
-            indices: list[int] | None = None
+            pos_accessor_index = attributes.get("POSITION")
+            if not isinstance(pos_accessor_index, int):
+                raise GlbError("Primitive has no POSITION accessor")
+
+            if primitive_indices is not None:
+                override_indices = primitive_indices.get((mesh_index, prim_index))
+                if override_indices is None:
+                    override_indices = []
+                filtering = True
+            else:
+                override_indices = None
+                filtering = False
+
+            if filtering and mode != TRIANGLES_MODE:
+                raise GlbError("Mesh split only supports TRIANGLES primitives")
+
+            if "indices" in primitive:
+                indices_accessor_index = primitive.get("indices")
+                if not isinstance(indices_accessor_index, int):
+                    raise GlbError("Invalid indices accessor index")
+                base_indices, _component_type = _read_indices(
+                    accessor_index=indices_accessor_index,
+                    gltf=gltf,
+                    bin_chunk=bin_chunk,
+                )
+            else:
+                count = accessors[pos_accessor_index].get("count")
+                if not isinstance(count, int) or count <= 0:
+                    raise GlbError("Invalid POSITION accessor.count")
+                base_indices = list(range(count))
+
+            indices_in = override_indices if override_indices is not None else base_indices
+            if len(indices_in) < 3 and (simplify_this or filtering):
+                continue
+            indices_in = indices_in[: (len(indices_in) // 3) * 3]
+
             if simplify_this:
-                if "indices" in primitive:
-                    indices_accessor_index = primitive.get("indices")
-                    if not isinstance(indices_accessor_index, int):
-                        raise GlbError("Invalid indices accessor index")
-                    indices, _component_type = _read_indices(
-                        accessor_index=indices_accessor_index,
+                indices_out = _simplify_triangles(
+                    indices=indices_in,
+                    ratio=simplify_ratio,
+                    method=simplify_method,
+                    position_accessor_index=pos_accessor_index,
+                    attributes=attributes,
+                    gltf=gltf,
+                    bin_chunk=bin_chunk,
+                    target_error=simplify_error,
+                )
+            else:
+                indices_out = indices_in
+
+            create_indices = simplify_this or filtering
+            rebuild_this = rebuild_vertices and create_indices
+
+            if create_indices and not indices_out:
+                continue
+
+            if rebuild_this:
+                vertex_indices, remapped_indices = _compact_vertex_indices(indices_out)
+
+                new_attrs: dict[str, Any] = {}
+                for name, acc_index in attributes.items():
+                    if not isinstance(acc_index, int):
+                        raise GlbError("Invalid attribute accessor index")
+                    attr_data = _extract_accessor_elements_bytes(
+                        accessor_index=acc_index,
+                        element_indices=vertex_indices,
                         gltf=gltf,
                         bin_chunk=bin_chunk,
                     )
-                else:
-                    pos_accessor_index = attributes.get("POSITION")
-                    if not isinstance(pos_accessor_index, int):
-                        raise GlbError("Primitive has no POSITION for non-indexed triangles")
-                    count = accessors[pos_accessor_index].get("count")
-                    if not isinstance(count, int) or count <= 0:
-                        raise GlbError("Invalid POSITION accessor.count")
-                    indices = list(range(count))
-
-                if len(indices) < 3:
-                    raise GlbError("Triangle primitive has too few indices")
-                indices = indices[: (len(indices) // 3) * 3]
-                sampled = _sample_triangles(indices, simplify_ratio)
-
-                if rebuild_this:
-                    vertex_indices, remapped_indices = _compact_vertex_indices(sampled)
-
-                    new_attrs: dict[str, Any] = {}
-                    for name, acc_index in attributes.items():
-                        if not isinstance(acc_index, int):
-                            raise GlbError("Invalid attribute accessor index")
-                        attr_data = _extract_accessor_elements_bytes(
-                            accessor_index=acc_index,
-                            element_indices=vertex_indices,
-                            gltf=gltf,
-                            bin_chunk=bin_chunk,
-                        )
-                        old_accessor = accessors[acc_index]
-                        new_accessor = {
-                            "componentType": old_accessor.get("componentType"),
-                            "type": old_accessor.get("type"),
-                            "count": len(vertex_indices),
-                        }
-                        if old_accessor.get("normalized"):
-                            new_accessor["normalized"] = True
-                        if name == "POSITION":
-                            if old_accessor.get("componentType") != COMPONENT_TYPE_FLOAT32 or old_accessor.get("type") != "VEC3":
-                                raise GlbError("POSITION must be VEC3 float32 for vertex rebuild")
-                            min_v, max_v = _vec3_f32_min_max(attr_data)
-                            new_accessor["min"] = min_v
-                            new_accessor["max"] = max_v
-                        new_attrs[name] = add_new_accessor_blob(accessor=new_accessor, data=attr_data, target=TARGET_ARRAY_BUFFER)
-                    new_prim["attributes"] = new_attrs
-
-                    if "targets" in primitive:
-                        new_targets: list[dict[str, Any]] = []
-                        for target in primitive["targets"]:
-                            new_target: dict[str, Any] = {}
-                            for name, acc_index in target.items():
-                                if not isinstance(acc_index, int):
-                                    raise GlbError("Invalid target accessor index")
-                                target_data = _extract_accessor_elements_bytes(
-                                    accessor_index=acc_index,
-                                    element_indices=vertex_indices,
-                                    gltf=gltf,
-                                    bin_chunk=bin_chunk,
-                                )
-                                old_accessor = accessors[acc_index]
-                                new_accessor = {
-                                    "componentType": old_accessor.get("componentType"),
-                                    "type": old_accessor.get("type"),
-                                    "count": len(vertex_indices),
-                                }
-                                if old_accessor.get("normalized"):
-                                    new_accessor["normalized"] = True
-                                new_target[name] = add_new_accessor_blob(
-                                    accessor=new_accessor,
-                                    data=target_data,
-                                    target=TARGET_ARRAY_BUFFER,
-                                )
-                            new_targets.append(new_target)
-                        new_prim["targets"] = new_targets
-
-                    max_index = max(remapped_indices) if remapped_indices else 0
-                    component_type = _choose_index_component_type(max_index)
-                    index_accessor = {
-                        "componentType": component_type,
-                        "type": "SCALAR",
-                        "count": len(remapped_indices),
+                    old_accessor = accessors[acc_index]
+                    new_accessor = {
+                        "componentType": old_accessor.get("componentType"),
+                        "type": old_accessor.get("type"),
+                        "count": len(vertex_indices),
                     }
-                    index_data = _pack_indices(remapped_indices, component_type)
-                    new_prim["indices"] = add_new_accessor_blob(
-                        accessor=index_accessor,
-                        data=index_data,
-                        target=TARGET_ELEMENT_ARRAY_BUFFER,
-                    )
-                else:
-                    new_attrs = {}
-                    for name, acc_index in attributes.items():
-                        if not isinstance(acc_index, int):
-                            raise GlbError("Invalid attribute accessor index")
-                        used_accessors.add(acc_index)
-                        new_attrs[name] = acc_index
-                    new_prim["attributes"] = new_attrs
+                    if old_accessor.get("normalized"):
+                        new_accessor["normalized"] = True
+                    if name == "POSITION":
+                        if old_accessor.get("componentType") != COMPONENT_TYPE_FLOAT32 or old_accessor.get("type") != "VEC3":
+                            raise GlbError("POSITION must be VEC3 float32 for vertex rebuild")
+                        min_v, max_v = _vec3_f32_min_max(attr_data)
+                        new_accessor["min"] = min_v
+                        new_accessor["max"] = max_v
+                    new_attrs[name] = add_new_accessor_blob(accessor=new_accessor, data=attr_data, target=TARGET_ARRAY_BUFFER)
+                new_prim["attributes"] = new_attrs
 
-                    if "targets" in primitive:
-                        new_targets = []
-                        for target in primitive["targets"]:
-                            new_target: dict[str, int] = {}
-                            for name, acc_index in target.items():
-                                if not isinstance(acc_index, int):
-                                    raise GlbError("Invalid target accessor index")
-                                used_accessors.add(acc_index)
-                                new_target[name] = acc_index
-                            new_targets.append(new_target)
-                        new_prim["targets"] = new_targets
+                if "targets" in primitive:
+                    new_targets: list[dict[str, Any]] = []
+                    for target in primitive["targets"]:
+                        new_target: dict[str, Any] = {}
+                        for name, acc_index in target.items():
+                            if not isinstance(acc_index, int):
+                                raise GlbError("Invalid target accessor index")
+                            target_data = _extract_accessor_elements_bytes(
+                                accessor_index=acc_index,
+                                element_indices=vertex_indices,
+                                gltf=gltf,
+                                bin_chunk=bin_chunk,
+                            )
+                            old_accessor = accessors[acc_index]
+                            new_accessor = {
+                                "componentType": old_accessor.get("componentType"),
+                                "type": old_accessor.get("type"),
+                                "count": len(vertex_indices),
+                            }
+                            if old_accessor.get("normalized"):
+                                new_accessor["normalized"] = True
+                            new_target[name] = add_new_accessor_blob(
+                                accessor=new_accessor,
+                                data=target_data,
+                                target=TARGET_ARRAY_BUFFER,
+                            )
+                        new_targets.append(new_target)
+                    new_prim["targets"] = new_targets
 
-                    max_index = max(sampled) if sampled else 0
-                    component_type = _choose_index_component_type(max_index)
-                    index_accessor = {
-                        "componentType": component_type,
-                        "type": "SCALAR",
-                        "count": len(sampled),
-                    }
-                    index_data = _pack_indices(sampled, component_type)
-                    new_prim["indices"] = add_new_accessor_blob(
-                        accessor=index_accessor,
-                        data=index_data,
-                        target=TARGET_ELEMENT_ARRAY_BUFFER,
-                    )
+                max_index = max(remapped_indices) if remapped_indices else 0
+                component_type = _choose_index_component_type(max_index)
+                index_accessor = {
+                    "componentType": component_type,
+                    "type": "SCALAR",
+                    "count": len(remapped_indices),
+                }
+                index_data = _pack_indices(remapped_indices, component_type)
+                new_prim["indices"] = add_new_accessor_blob(
+                    accessor=index_accessor,
+                    data=index_data,
+                    target=TARGET_ELEMENT_ARRAY_BUFFER,
+                )
             else:
                 new_attrs = {}
                 for name, acc_index in attributes.items():
@@ -1251,7 +1882,23 @@ def build_subset_glb(
                         new_targets.append(new_target)
                     new_prim["targets"] = new_targets
 
-                if "indices" in primitive:
+                if create_indices:
+                    if not indices_out:
+                        continue
+                    max_index = max(indices_out) if indices_out else 0
+                    component_type = _choose_index_component_type(max_index)
+                    index_accessor = {
+                        "componentType": component_type,
+                        "type": "SCALAR",
+                        "count": len(indices_out),
+                    }
+                    index_data = _pack_indices(indices_out, component_type)
+                    new_prim["indices"] = add_new_accessor_blob(
+                        accessor=index_accessor,
+                        data=index_data,
+                        target=TARGET_ELEMENT_ARRAY_BUFFER,
+                    )
+                elif "indices" in primitive:
                     indices_accessor_index = primitive.get("indices")
                     if not isinstance(indices_accessor_index, int):
                         raise GlbError("Invalid indices accessor index")
@@ -1262,6 +1909,8 @@ def build_subset_glb(
 
             new_primitives.append(new_prim)
 
+        if not new_primitives:
+            continue
         new_mesh["primitives"] = new_primitives
         new_meshes.append(new_mesh)
 
@@ -1429,7 +2078,7 @@ def _finite_number(value: str) -> float:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a quadtree tileset with leaf tiles and a sampling-based root LOD from a GLB.",
+        description="Generate a quadtree tileset with leaf tiles and optional multi-level sampling LOD from a GLB.",
     )
     parser.add_argument("input_glb", type=Path, help="Input .glb file")
     parser.add_argument("output_dir", type=Path, help="Output directory to write tileset.json and tiles")
@@ -1446,7 +2095,79 @@ def parse_args() -> argparse.Namespace:
         "--simplify-ratio",
         type=_finite_number,
         default=0.15,
-        help="Triangle sampling ratio for root LOD (default: 0.15)",
+        help="Base triangle sampling ratio for LOD (root level, default: 0.15)",
+    )
+    parser.add_argument(
+        "--simplify-target-tris",
+        type=int,
+        default=None,
+        help="Clamp LOD triangle count per tile (optional)",
+    )
+    parser.add_argument(
+        "--simplify-method",
+        default="sample",
+        choices=["sample", "meshopt"],
+        help="Simplify method for LOD meshes (default: sample)",
+    )
+    parser.add_argument(
+        "--meshopt-error",
+        type=_finite_number,
+        default=0.01,
+        help="Target error for meshopt simplification (default: 0.01)",
+    )
+    parser.add_argument(
+        "--split-mesh",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Split oversized leaf tiles by triangle spatial partition (default: False)",
+    )
+    parser.add_argument(
+        "--draco",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Compress output glb with Draco (requires gltf-transform or gltf-pipeline)",
+    )
+    parser.add_argument(
+        "--draco-tool",
+        default="auto",
+        choices=["auto", "gltf-transform", "gltf-pipeline"],
+        help="Draco tool to use (default: auto)",
+    )
+    parser.add_argument(
+        "--ktx2",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Compress textures to KTX2 (ETC1S/UASTC) using gltf-transform",
+    )
+    parser.add_argument(
+        "--ktx2-mode",
+        default="etc1s",
+        choices=["etc1s", "uastc"],
+        help="KTX2 compression mode (default: etc1s)",
+    )
+    parser.add_argument(
+        "--ktx2-quality",
+        type=int,
+        default=None,
+        help="KTX2 quality (ETC1S: 1-255, UASTC: 0-4)",
+    )
+    parser.add_argument(
+        "--ktx2-rdo-threshold",
+        type=_finite_number,
+        default=None,
+        help="ETC1S RDO threshold (default: tool default)",
+    )
+    parser.add_argument(
+        "--lod-internal",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Generate simplified content for internal tiles (default: False)",
+    )
+    parser.add_argument(
+        "--lod-ratio-scale",
+        type=_finite_number,
+        default=2.0,
+        help="Multiply simplify ratio by this per depth (default: 2.0)",
     )
     parser.add_argument(
         "--rebuild-vertices",
@@ -1499,6 +2220,26 @@ def _geometric_error_for_tile(tile: QuadTile, root_error: float) -> float:
     return root_error / (2**tile.depth)
 
 
+def _lod_ratio_for_depth(depth: int, *, base_ratio: float, ratio_scale: float) -> float:
+    ratio = base_ratio * (ratio_scale**depth)
+    return min(1.0, ratio)
+
+
+def _lod_ratio_for_tile(
+    tile: QuadTile,
+    *,
+    base_ratio: float,
+    ratio_scale: float,
+    target_tris: int | None,
+) -> float:
+    ratio = _lod_ratio_for_depth(tile.depth, base_ratio=base_ratio, ratio_scale=ratio_scale)
+    if target_tris is not None and tile.triangle_count > 0:
+        target_ratio = target_tris / tile.triangle_count
+        if target_ratio < ratio:
+            ratio = max(0.0, min(1.0, target_ratio))
+    return ratio
+
+
 def _tile_to_json(tile: QuadTile, *, root_error: float, refine: str, min_half_extent: float) -> dict[str, Any]:
     node = {
         "boundingVolume": {"box": aabb_to_tileset_box(tile.aabb, min_half_extent=min_half_extent)},
@@ -1526,13 +2267,22 @@ def main() -> int:
         raise GlbError("--max-depth must be >= 0")
     if args.simplify_ratio <= 0:
         raise GlbError("--simplify-ratio must be > 0")
+    if args.simplify_target_tris is not None and args.simplify_target_tris <= 0:
+        raise GlbError("--simplify-target-tris must be > 0")
+    if args.ktx2_quality is not None:
+        if args.ktx2_mode == "etc1s" and not (1 <= args.ktx2_quality <= 255):
+            raise GlbError("--ktx2-quality for etc1s must be in [1, 255]")
+        if args.ktx2_mode == "uastc" and not (0 <= args.ktx2_quality <= 4):
+            raise GlbError("--ktx2-quality for uastc must be in [0, 4]")
+    if args.ktx2_rdo_threshold is not None and args.ktx2_mode != "etc1s":
+        raise GlbError("--ktx2-rdo-threshold is only valid for etc1s")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     tiles_dir = output_dir / "tiles"
     tiles_dir.mkdir(parents=True, exist_ok=True)
 
     gltf, bin_chunk = read_glb(input_glb)
-    node_infos, scene_root_nodes, parent_map, scene_nodes = compute_scene_nodes(gltf, bin_chunk)
+    node_infos, scene_root_nodes, parent_map, scene_nodes, node_world_matrices = compute_scene_nodes(gltf, bin_chunk)
 
     external_image_uris: dict[int, str] | None = None
     if args.external_textures:
@@ -1560,6 +2310,18 @@ def main() -> int:
         max_depth=args.max_depth,
     )
 
+    if args.split_mesh:
+        mesh_usage = compute_mesh_usage(gltf, scene_nodes)
+        split_large_tiles_by_mesh(
+            root_tile,
+            gltf=gltf,
+            bin_chunk=bin_chunk,
+            node_world_matrices=node_world_matrices,
+            mesh_usage=mesh_usage,
+            max_tris=args.max_tris,
+            max_depth=args.max_depth,
+        )
+
     leaves = collect_leaf_tiles(root_tile)
     for tile in leaves:
         tile_id = f"L{tile.depth}_X{tile.x}_Y{tile.y}"
@@ -1576,28 +2338,108 @@ def main() -> int:
             mesh_nodes=mesh_nodes,
             root_nodes=root_nodes,
             simplify_ratio=1.0,
-            rebuild_vertices=False,
+            simplify_method=args.simplify_method,
+            simplify_error=args.meshopt_error,
+            rebuild_vertices=args.rebuild_vertices if tile.primitive_indices else False,
+            primitive_indices=tile.primitive_indices,
             externalize_textures=args.external_textures,
             external_image_uris=external_image_uris,
         )
-        write_glb(tiles_dir / f"{tile_id}.glb", subset_gltf, subset_bin)
+        write_glb_maybe_compress(
+            tiles_dir / f"{tile_id}.glb",
+            subset_gltf,
+            subset_bin,
+            draco=args.draco,
+            draco_tool=args.draco_tool,
+            ktx2=args.ktx2,
+            ktx2_mode=args.ktx2_mode,
+            ktx2_quality=args.ktx2_quality,
+            ktx2_rdo_threshold=args.ktx2_rdo_threshold,
+        )
 
-    if args.simplify_ratio < 1.0:
+    if args.lod_internal:
+        nodes_by_tile = collect_subtree_nodes(root_tile)
+        stack = [root_tile]
+        while stack:
+            tile = stack.pop()
+            if tile.children:
+                stack.extend(tile.children)
+                ratio = _lod_ratio_for_tile(
+                    tile,
+                    base_ratio=args.simplify_ratio,
+                    ratio_scale=args.lod_ratio_scale,
+                    target_tris=args.simplify_target_tris,
+                )
+                if tile.depth == 0:
+                    content_uri = "tiles/root_simplified.glb"
+                else:
+                    content_uri = f"tiles/N{tile.depth}_X{tile.x}_Y{tile.y}.glb"
+                tile.content_uri = content_uri
+
+                node_indices = nodes_by_tile.get((tile.depth, tile.x, tile.y), set())
+                nodes_keep = collect_nodes_with_ancestors(node_indices, parent_map)
+                root_nodes = collect_root_nodes(nodes_keep, parent_map)
+                mesh_nodes = set(node_indices)
+                subset_gltf, subset_bin = build_subset_glb(
+                    gltf,
+                    bin_chunk,
+                    nodes_to_keep=nodes_keep,
+                    mesh_nodes=mesh_nodes,
+                    root_nodes=root_nodes,
+                    simplify_ratio=ratio,
+                    simplify_method=args.simplify_method,
+                    simplify_error=args.meshopt_error,
+                    rebuild_vertices=args.rebuild_vertices,
+                    primitive_indices=None,
+                    externalize_textures=args.external_textures,
+                    external_image_uris=external_image_uris,
+                )
+                write_glb_maybe_compress(
+                    output_dir / content_uri,
+                    subset_gltf,
+                    subset_bin,
+                    draco=args.draco,
+                    draco_tool=args.draco_tool,
+                    ktx2=args.ktx2,
+                    ktx2_mode=args.ktx2_mode,
+                    ktx2_quality=args.ktx2_quality,
+                    ktx2_rdo_threshold=args.ktx2_rdo_threshold,
+                )
+    elif args.simplify_ratio < 1.0:
         root_content = "tiles/root_simplified.glb"
         mesh_nodes = {info.node_index for info in node_infos}
         root_nodes = [n for n in scene_root_nodes if n in scene_nodes]
+        ratio = _lod_ratio_for_tile(
+            root_tile,
+            base_ratio=args.simplify_ratio,
+            ratio_scale=1.0,
+            target_tris=args.simplify_target_tris,
+        )
         subset_gltf, subset_bin = build_subset_glb(
             gltf,
             bin_chunk,
             nodes_to_keep=scene_nodes,
             mesh_nodes=mesh_nodes,
             root_nodes=root_nodes,
-            simplify_ratio=args.simplify_ratio,
+            simplify_ratio=ratio,
+            simplify_method=args.simplify_method,
+            simplify_error=args.meshopt_error,
             rebuild_vertices=args.rebuild_vertices,
+            primitive_indices=None,
             externalize_textures=args.external_textures,
             external_image_uris=external_image_uris,
         )
-        write_glb(output_dir / root_content, subset_gltf, subset_bin)
+        write_glb_maybe_compress(
+            output_dir / root_content,
+            subset_gltf,
+            subset_bin,
+            draco=args.draco,
+            draco_tool=args.draco_tool,
+            ktx2=args.ktx2,
+            ktx2_mode=args.ktx2_mode,
+            ktx2_quality=args.ktx2_quality,
+            ktx2_rdo_threshold=args.ktx2_rdo_threshold,
+        )
         root_tile.content_uri = root_content
 
     root_error = args.geometric_error

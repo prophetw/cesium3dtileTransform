@@ -58,6 +58,39 @@ python3 tools/glb_to_tileset_quadtree.py path/to/model.glb out_tiles/ \
 - 纹理/材质会被拷贝到每个 tile 内（未做共享）
 - 如觉得输出体积过大，可启用 `--external-textures` 避免每个 GLB 内重复内嵌纹理
 
+## V4（多层 LOD，父粗子细）
+
+- 输入：单个 `*.glb`
+- 输出：quadtree tileset（叶子 tile + 多层 LOD）
+- 脚本：`tools/glb_to_tileset_quadtree.py`
+
+### 用法
+
+```bash
+python3 tools/glb_to_tileset_quadtree.py path/to/model.glb out_tiles/ \
+  --max-tris 200000 --simplify-ratio 0.15 --simplify-method meshopt \
+  --lod-internal --lod-ratio-scale 2.0 --simplify-target-tris 200000 \
+  --split-mesh --draco --ktx2 --ktx2-mode etc1s --pretty
+```
+
+输出目录（新增）：
+
+- `out/out_tiles/tiles/N{depth}_X{x}_Y{y}.glb`（内部节点 LOD）
+
+说明：
+
+- 在每个内部节点生成采样 LOD（比 V3 多层）
+- LOD 简化比例按深度递增：`simplify_ratio * (lod_ratio_scale ** depth)`，超过 1 则视为不生成
+- root 仍输出为 `tiles/root_simplified.glb`
+- 可用 `--simplify-target-tris` 限制每个 LOD tile 的目标三角形数，避免父级 glb 过大
+- 可用 `--split-mesh` 把超大 leaf tile 按三角形中心拆分为更小子瓦片（仅支持 TRIANGLES，且 mesh 不可被多个 node 复用）
+- 可用 `--draco` 对输出 GLB 进行 Draco 压缩（依赖 `gltf-transform` 或 `gltf-pipeline`，可用 `--draco-tool` 指定）
+- 可用 `--ktx2` 把纹理压缩为 KTX2（ETC1S/UASTC），依赖 `gltf-transform` + KTX-Software (`toktx`)
+- `gltf-transform` 安装：`npm i -g @gltf-transform/cli`；`gltf-pipeline` 安装：`npm i -g gltf-pipeline`
+- `toktx` 来自 KTX-Software（https://github.com/KhronosGroup/KTX-Software）
+- `--simplify-method meshopt` 需要安装 `numpy` + `meshoptimizer`（`pip install meshoptimizer`）
+- meshopt 会尽量利用 `NORMAL` / `TEXCOORD_0` 做保真简化（若存在），可用 `--meshopt-error` 调整误差目标；部分环境会自动回退到位置简化
+
 ## 地理定位（用户输入）
 
 模型是“纯局部坐标”时，可以在导出后让用户输入地理坐标，直接修改 `root.transform`：
@@ -96,10 +129,10 @@ tileset.modelMatrix = Cesium.Transforms.headingPitchRollToFixedFrame(origin, hpr
 - 仅支持 `.glb`（GLB 2.0）
 - `POSITION` 仅支持 `float32`，且不支持 sparse accessor
 
-## 限制（V3）
+## 限制（V3/V4）
 
 - 仅支持 `TRIANGLES` primitive
-- 不支持 skin/animation/Draco/sparse accessor
+- 不支持 skin/animation/Draco 输入/sparse accessor
 - 简化为三角形采样（不是 QEM 等真实简化），外观/拓扑不保证最优
 - `--external-textures` 会让 GLB 依赖外部纹理文件（不再是单文件自包含）
 
