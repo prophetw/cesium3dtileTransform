@@ -2059,11 +2059,46 @@ def build_subset_glb(
     return new_gltf, bytes(new_bin)
 
 
-def aabb_to_tileset_box(aabb: Aabb, *, min_half_extent: float = 0.0) -> list[float]:
+def _expand_aabb_for_bv(
+    aabb: Aabb,
+    *,
+    min_half_extent: float = 0.0,
+    min_half_extent_ratio: float = 0.0,
+) -> Aabb:
     center, half = aabb.center_and_half_extents(min_half_extent=min_half_extent)
+    if min_half_extent_ratio > 0:
+        max_half = max(half)
+        if max_half > 0:
+            ratio_extent = max_half * min_half_extent_ratio
+            half = (
+                max(half[0], ratio_extent),
+                max(half[1], ratio_extent),
+                max(half[2], ratio_extent),
+            )
+    cx, cy, cz = center
+    hx, hy, hz = half
+    return Aabb((cx - hx, cy - hy, cz - hz), (cx + hx, cy + hy, cz + hz))
+
+
+def _aabb_to_tileset_box(aabb: Aabb) -> list[float]:
+    center, half = aabb.center_and_half_extents()
     cx, cy, cz = center
     hx, hy, hz = half
     return [cx, cy, cz, hx, 0, 0, 0, hy, 0, 0, 0, hz]
+
+
+def aabb_to_tileset_box(
+    aabb: Aabb,
+    *,
+    min_half_extent: float = 0.0,
+    min_half_extent_ratio: float = 0.0,
+) -> list[float]:
+    expanded = _expand_aabb_for_bv(
+        aabb,
+        min_half_extent=min_half_extent,
+        min_half_extent_ratio=min_half_extent_ratio,
+    )
+    return _aabb_to_tileset_box(expanded)
 
 
 def _finite_number(value: str) -> float:
@@ -2196,6 +2231,18 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Clamp each half-extent to at least this many meters (default: 0)",
     )
+    parser.add_argument(
+        "--min-half-extent-factor",
+        type=_finite_number,
+        default=1e-4,
+        help="Clamp half-extent to at least (root diagonal * factor) (default: 1e-4)",
+    )
+    parser.add_argument(
+        "--min-half-extent-ratio",
+        type=_finite_number,
+        default=0.02,
+        help="Clamp each half-extent to at least (max half-extent * ratio) (default: 0.02)",
+    )
     parser.add_argument("--asset-version", default="1.1", help="tileset asset.version (default: 1.1)")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON (indent=2)")
     return parser.parse_args()
@@ -2240,17 +2287,45 @@ def _lod_ratio_for_tile(
     return ratio
 
 
-def _tile_to_json(tile: QuadTile, *, root_error: float, refine: str, min_half_extent: float) -> dict[str, Any]:
+def _tile_to_json(
+    tile: QuadTile,
+    *,
+    root_error: float,
+    refine: str,
+    min_half_extent: float,
+    min_half_extent_ratio: float,
+) -> tuple[dict[str, Any], Aabb]:
+    child_nodes: list[dict[str, Any]] = []
+    child_aabbs: list[Aabb] = []
+    for child in tile.children:
+        child_node, child_aabb = _tile_to_json(
+            child,
+            root_error=root_error,
+            refine=refine,
+            min_half_extent=min_half_extent,
+            min_half_extent_ratio=min_half_extent_ratio,
+        )
+        child_nodes.append(child_node)
+        child_aabbs.append(child_aabb)
+
+    tile_aabb = _expand_aabb_for_bv(
+        tile.aabb,
+        min_half_extent=min_half_extent,
+        min_half_extent_ratio=min_half_extent_ratio,
+    )
+    for child_aabb in child_aabbs:
+        tile_aabb = tile_aabb.union(child_aabb)
+
     node = {
-        "boundingVolume": {"box": aabb_to_tileset_box(tile.aabb, min_half_extent=min_half_extent)},
+        "boundingVolume": {"box": _aabb_to_tileset_box(tile_aabb)},
         "geometricError": _geometric_error_for_tile(tile, root_error),
         "refine": refine,
     }
     if tile.content_uri:
         node["content"] = {"uri": tile.content_uri}
-    if tile.children:
-        node["children"] = [_tile_to_json(child, root_error=root_error, refine=refine, min_half_extent=min_half_extent) for child in tile.children]
-    return node
+    if child_nodes:
+        node["children"] = child_nodes
+    return node, tile_aabb
 
 
 def main() -> int:
@@ -2276,6 +2351,12 @@ def main() -> int:
             raise GlbError("--ktx2-quality for uastc must be in [0, 4]")
     if args.ktx2_rdo_threshold is not None and args.ktx2_mode != "etc1s":
         raise GlbError("--ktx2-rdo-threshold is only valid for etc1s")
+    if args.min_half_extent < 0:
+        raise GlbError("--min-half-extent must be >= 0")
+    if args.min_half_extent_factor < 0:
+        raise GlbError("--min-half-extent-factor must be >= 0")
+    if args.min_half_extent_ratio < 0:
+        raise GlbError("--min-half-extent-ratio must be >= 0")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     tiles_dir = output_dir / "tiles"
@@ -2442,23 +2523,28 @@ def main() -> int:
         )
         root_tile.content_uri = root_content
 
+    root_diag = _compute_diagonal(root_tile.aabb)
     root_error = args.geometric_error
     if root_error is None:
-        root_error = _compute_diagonal(root_tile.aabb) * args.error_factor
+        root_error = root_diag * args.error_factor
 
     tileset_geometric_error = args.tileset_geometric_error
     if tileset_geometric_error is None:
         tileset_geometric_error = root_error
 
+    min_half_extent = max(args.min_half_extent, root_diag * args.min_half_extent_factor)
+
+    root_node, _root_aabb = _tile_to_json(
+        root_tile,
+        root_error=root_error,
+        refine=args.refine,
+        min_half_extent=min_half_extent,
+        min_half_extent_ratio=args.min_half_extent_ratio,
+    )
     tileset = {
         "asset": {"version": args.asset_version},
         "geometricError": tileset_geometric_error,
-        "root": _tile_to_json(
-            root_tile,
-            root_error=root_error,
-            refine=args.refine,
-            min_half_extent=args.min_half_extent,
-        ),
+        "root": root_node,
     }
 
     tileset_path = output_dir / "tileset.json"

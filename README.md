@@ -86,6 +86,7 @@ python3 tools/glb_to_tileset_quadtree.py path/to/model.glb out_tiles/ \
 - 可用 `--split-mesh` 把超大 leaf tile 按三角形中心拆分为更小子瓦片（仅支持 TRIANGLES，且 mesh 不可被多个 node 复用）
 - 可用 `--draco` 对输出 GLB 进行 Draco 压缩（依赖 `gltf-transform` 或 `gltf-pipeline`，可用 `--draco-tool` 指定）
 - 可用 `--ktx2` 把纹理压缩为 KTX2（ETC1S/UASTC），依赖 `gltf-transform` + KTX-Software (`toktx`)
+- 可用 `--min-half-extent`/`--min-half-extent-factor`/`--min-half-extent-ratio` 增大 boundingVolume，避免近景角度出现裁剪
 - `gltf-transform` 安装：`npm i -g @gltf-transform/cli`；`gltf-pipeline` 安装：`npm i -g gltf-pipeline`
 - `toktx` 来自 KTX-Software（https://github.com/KhronosGroup/KTX-Software）
 - `--simplify-method meshopt` 需要安装 `numpy` + `meshoptimizer`（`pip install meshoptimizer`）
