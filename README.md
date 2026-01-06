@@ -140,3 +140,25 @@ tileset.modelMatrix = Cesium.Transforms.headingPitchRollToFixedFrame(origin, hpr
 ## 文档
 
 - `doc.md`：实现思路/术语/后续路线
+
+
+
+## 命令
+```bash
+
+# osm pbf => glb
+python3 tools/osm_to_glb.py shanghai-260105.osm.pbf shanghai.glb
+
+# osm => glb
+python3 tools/osm_to_glb.py shanghai-260105.osm shanghai.glb
+
+# 
+python3 tools/glb_to_tileset_quadtree.py shanghai.glb  out_shanghai_osm_tiles/ \
+  --max-tris 100000 --max-depth 10 --split-mesh \
+  --simplify-ratio 0.15 --simplify-method meshopt \
+  --lod-internal --lod-ratio-scale 2.0 --simplify-target-tris 200000 \
+  --external-textures --draco --draco-tool gltf-transform \
+  --ktx2 --ktx2-mode etc1s --ktx2-quality 128 \
+  --min-half-extent 0.5 --pretty \
+  --y-up
+```

@@ -1160,6 +1160,7 @@ def compute_mesh_triangle_count(
 def compute_scene_nodes(
     gltf: dict[str, Any],
     bin_chunk: bytes,
+    initial_transform: list[float] | None = None,
 ) -> tuple[list[NodeInfo], list[int], dict[int, int], set[int], dict[int, list[float]]]:
     scenes = gltf.get("scenes", [])
     nodes = gltf.get("nodes", [])
@@ -1203,10 +1204,13 @@ def compute_scene_nodes(
     scene_nodes: set[int] = set()
     node_world_matrices: dict[int, list[float]] = {}
 
+    if initial_transform is None:
+        initial_transform = _mat4_identity()
+
     for root_node_index in root_node_indices:
         if not isinstance(root_node_index, int):
             raise GlbError("Invalid root node index")
-        for node_index, node_world_matrix in traverse(root_node_index, _mat4_identity()):
+        for node_index, node_world_matrix in traverse(root_node_index, initial_transform):
             scene_nodes.add(node_index)
             node_world_matrices[node_index] = node_world_matrix
             node = nodes[node_index]
@@ -2245,6 +2249,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--asset-version", default="1.1", help="tileset asset.version (default: 1.1)")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON (indent=2)")
+    parser.add_argument(
+        "--y-up",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Add Y-up to Z-up transform to root node (use when source model is Y-up, default: False)",
+    )
     return parser.parse_args()
 
 
@@ -2363,7 +2373,30 @@ def main() -> int:
     tiles_dir.mkdir(parents=True, exist_ok=True)
 
     gltf, bin_chunk = read_glb(input_glb)
-    node_infos, scene_root_nodes, parent_map, scene_nodes, node_world_matrices = compute_scene_nodes(gltf, bin_chunk)
+    # Y-up to Z-up transform matrix (column-major):
+    # [1  0  0  0]   Column 0: X → X
+    # [0  0 -1  0]   Column 1: Y → Z (height becomes up)
+    # [0  1  0  0]   Column 2: Z → -Y (south becomes north)
+    # [0  0  0  1]   Column 3: translation (none)
+    #
+    # This transforms: (X, Y_up, Z_south) → (X, -Z_south=North, Y_up=Up)
+    # So the result is proper Z-up ENU coordinates.
+    # This transform is needed for quadtree partitioning (which uses X-Y plane)
+    # and for bounding box calculation in Z-up space.
+    y_up_to_z_up_transform: list[float] | None = None
+    if args.y_up:
+        y_up_to_z_up_transform = [
+            1, 0, 0, 0,
+            0, 0, 1, 0,
+            0, -1, 0, 0,
+            0, 0, 0, 1,
+        ]
+
+    # Compute node infos WITH the Y-up transform so AABBs are in Z-up space
+    # and quadtree partitioning works correctly on the X-Y horizontal plane.
+    node_infos, scene_root_nodes, parent_map, scene_nodes, node_world_matrices = compute_scene_nodes(
+        gltf, bin_chunk, initial_transform=y_up_to_z_up_transform
+    )
 
     external_image_uris: dict[int, str] | None = None
     if args.external_textures:
@@ -2541,6 +2574,7 @@ def main() -> int:
         min_half_extent=min_half_extent,
         min_half_extent_ratio=args.min_half_extent_ratio,
     )
+
     tileset = {
         "asset": {"version": args.asset_version},
         "geometricError": tileset_geometric_error,
