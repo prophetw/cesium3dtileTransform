@@ -2131,10 +2131,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tris", type=int, default=200_000, help="Max triangles per leaf tile (default: 200000)")
     parser.add_argument("--max-depth", type=int, default=8, help="Max quadtree depth (default: 8)")
     parser.add_argument(
+        "--simplify-preset",
+        default=None,
+        choices=["auto", "buildings", "terrain", "photogrammetry", "none"],
+        help="Preset simplification strategy. Overrides --simplify-ratio and --simplify-method if set. "
+             "'buildings': disable simplification (ratio=1.0), "
+             "'terrain': aggressive meshopt (ratio=0.15), "
+             "'photogrammetry': moderate meshopt (ratio=0.5), "
+             "'none': no simplification (ratio=1.0), "
+             "'auto': detect model characteristics and choose strategy.",
+    )
+    parser.add_argument(
         "--simplify-ratio",
         type=_finite_number,
         default=0.15,
-        help="Base triangle sampling ratio for LOD (root level, default: 0.15)",
+        help="Base triangle sampling ratio for LOD (root level, default: 0.15). Overridden by --simplify-preset.",
     )
     parser.add_argument(
         "--simplify-target-tris",
@@ -2338,6 +2349,76 @@ def _tile_to_json(
     return node, tile_aabb
 
 
+def _detect_model_type(gltf: dict[str, Any], node_infos: list[NodeInfo]) -> str:
+    """Detect model type based on characteristics to choose appropriate simplification strategy."""
+    nodes = gltf.get("nodes", [])
+    meshes = gltf.get("meshes", [])
+    materials = gltf.get("materials", [])
+    images = gltf.get("images", [])
+    
+    mesh_count = len([n for n in nodes if "mesh" in n])
+    total_tris = sum(info.triangle_count for info in node_infos)
+    has_textures = len(images) > 0
+    
+    # Heuristics for model type detection
+    # Buildings: Many separate meshes, no textures, thin geometry
+    if mesh_count > 50 and not has_textures:
+        return "buildings"
+    
+    # Photogrammetry: Has textures, typically single or few large meshes
+    if has_textures and mesh_count <= 10:
+        return "photogrammetry"
+    
+    # Terrain: Large continuous mesh, possibly with textures
+    if mesh_count <= 5 and total_tris > 100000:
+        return "terrain"
+    
+    # Default to conservative approach
+    return "buildings"
+
+
+def apply_simplify_preset(args: argparse.Namespace, gltf: dict[str, Any] | None = None, 
+                          node_infos: list[NodeInfo] | None = None) -> None:
+    """Apply simplification preset, overriding manual settings if preset is specified."""
+    preset = args.simplify_preset
+    if preset is None:
+        return
+    
+    # Auto-detect model type if gltf is provided
+    if preset == "auto":
+        if gltf is not None and node_infos is not None:
+            preset = _detect_model_type(gltf, node_infos)
+            print(f"Auto-detected model type: {preset}")
+        else:
+            # Fallback to conservative settings
+            preset = "buildings"
+            print(f"Auto-detection unavailable, using conservative preset: {preset}")
+    
+    # Apply preset configurations
+    if preset == "buildings":
+        # Buildings: disable simplification to preserve thin walls and roofs
+        args.simplify_ratio = 1.0
+        args.simplify_method = "sample"  # Doesn't matter with ratio=1.0
+        print("Preset 'buildings': Simplification disabled (ratio=1.0)")
+        
+    elif preset == "terrain":
+        # Terrain: aggressive simplification is safe for continuous surfaces
+        args.simplify_ratio = 0.15
+        args.simplify_method = "meshopt"
+        print("Preset 'terrain': Aggressive meshopt (ratio=0.15)")
+        
+    elif preset == "photogrammetry":
+        # Photogrammetry: moderate simplification with topology-aware method
+        args.simplify_ratio = 0.5
+        args.simplify_method = "meshopt"
+        print("Preset 'photogrammetry': Moderate meshopt (ratio=0.5)")
+        
+    elif preset == "none":
+        # Explicit no simplification
+        args.simplify_ratio = 1.0
+        print("Preset 'none': Simplification disabled (ratio=1.0)")
+
+
 def main() -> int:
     args = parse_args()
 
@@ -2397,6 +2478,9 @@ def main() -> int:
     node_infos, scene_root_nodes, parent_map, scene_nodes, node_world_matrices = compute_scene_nodes(
         gltf, bin_chunk, initial_transform=y_up_to_z_up_transform
     )
+
+    # Apply simplification preset (may override --simplify-ratio and --simplify-method)
+    apply_simplify_preset(args, gltf=gltf, node_infos=node_infos)
 
     external_image_uris: dict[int, str] | None = None
     if args.external_textures:

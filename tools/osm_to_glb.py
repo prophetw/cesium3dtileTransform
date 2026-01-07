@@ -272,19 +272,18 @@ def build_geometry(buildings, origin_lat, origin_lon):
             footprint.append((e, -n))
             
         # Ensure CCW winding for Ear Clipping (and correct face culling)
-        # Calculate signed area using shoelace formula: sum((x2-x1)*(y2+y1))
-        # In a coordinate system where Y increases upward:
-        # - Positive area = Clockwise winding
-        # - Negative area = Counter-clockwise winding
-        # For correct rendering with backface culling, we need CCW winding
-        # (so the front faces have outward normals).
+        # Calculate signed area using trapezoidal formula: sum((x2-x1)*(y2+y1))
+        # In footprint coords (fx, fz):
+        # - Negative area = CCW winding (correct for triangulation)
+        # - Positive area = CW winding (needs reversal)
+        # The ear clipping algorithm requires CCW input.
         area = 0.0
         for i in range(len(footprint)):
             p1 = footprint[i]
             p2 = footprint[(i + 1) % len(footprint)]
             area += (p2[0] - p1[0]) * (p2[1] + p1[1])
         
-        # Only reverse if winding is CW (positive area)
+        # Reverse if winding is CW (positive area)
         if area > 0:
             footprint.reverse()
 
@@ -405,7 +404,15 @@ def export_glb(positions, normals, indices, filename):
         "asset": {"version": "2.0", "generator": "osm_to_glb.py"},
         "scenes": [{"nodes": [0]}],
         "nodes": [{"mesh": 0}],
-        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2, "mode": 4}]}],
+        "materials": [{
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [0.7, 0.7, 0.7, 1.0],
+                "metallicFactor": 0.0,
+                "roughnessFactor": 0.8
+            },
+            "doubleSided": True
+        }],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2, "material": 0, "mode": 4}]}],
         "buffers": [{"byteLength": total_len}],
         "bufferViews": [
             {"buffer": 0, "byteOffset": 0, "byteLength": len(pos_bytes), "target": 34962},
