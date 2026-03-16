@@ -14,6 +14,7 @@ except ImportError:
 # Constants
 LEVEL_HEIGHT = 3.0  # Meters per level
 EARTH_RADIUS = 6378137.0
+MAX_BUILDING_HEIGHT = 800.0  # Max height in meters (Shanghai Tower is ~632m)
 
 def latlon_to_meters(lat, lon, origin_lat, origin_lon):
     """Simple Spherical Mercator projection relative to origin."""
@@ -249,6 +250,9 @@ def build_geometry(buildings, origin_lat, origin_lon):
             try:
                 height = float(tags['building:levels']) * LEVEL_HEIGHT
             except: pass
+        
+        # Clamp to max building height to avoid bad OSM data
+        height = min(height, MAX_BUILDING_HEIGHT)
             
         # Get Footprint vertices in local meters
         footprint = [] # (x, z)

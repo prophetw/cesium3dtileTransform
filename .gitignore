@@ -3,3 +3,6 @@ test.glb
 out
 CesiumV133
 out
+*.glb
+*.pbf
+*.osm

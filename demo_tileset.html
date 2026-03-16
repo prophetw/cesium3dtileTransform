@@ -95,14 +95,7 @@
       <label>
         Tileset
         <select id="tilesetSelect">
-          <option value="out_preset_auto">out_preset_auto (--simplify-preset auto)</option>
-          <option value="out_preset_buildings">out_preset_buildings (--simplify-preset buildings)</option>
-          <option value="out_gentle">out_gentle (0.8 simplification)</option>
-          <option value="out_simple">out_simple (no simplification)</option>
-          <option value="out_final">out_final</option>
-          <option value="out_doublesided">out_doublesided</option>
-          <option value="out_test_fixed2">out_test_fixed2</option>
-          <option value="out_tiles">out_tiles</option>
+          <option value="shanghai_tileset">shanghai_tileset</option>
         </select>
       </label>
       <button id="loadTileset">Load Selected</button>
@@ -149,11 +142,11 @@
     const tilesetSelectEl = document.getElementById("tilesetSelect");
     const defaultGeoref = {
       mode: "enu",
-      origin: [116.3913, 39.9075, 35.0],
+      origin: [121.5707, 31.2622, 0.0],  // Shanghai OSM data origin
       heading: 0.0,
       pitch: 0.0,
       roll: 0.0,
-      axis: "Z_UP",
+      axis: "Z_UP",  // --y-up flag handles Y→Z conversion in tileset
       unit: "m",
       scale: 1.0,
     };
