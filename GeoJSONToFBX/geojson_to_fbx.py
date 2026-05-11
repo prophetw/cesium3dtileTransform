@@ -143,8 +143,19 @@ except Exception:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert GeoJSON polygons to an extruded FBX via Blender")
-    parser.add_argument("input", help="Input GeoJSON file")
-    parser.add_argument("output", help="Output FBX file")
+    parser.add_argument("input", nargs="?", help="Input GeoJSON file")
+    parser.add_argument("output", nargs="?", help="Output FBX file")
+    parser.add_argument(
+        "-d",
+        "--directory",
+        type=Path,
+        help="Input directory. Converts every direct .geojson file to a same-name .fbx",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Output directory for --directory mode (default: input directory)",
+    )
     parser.add_argument(
         "--coordinates",
         choices=["geographic", "planar"],
@@ -190,7 +201,35 @@ def parse_args() -> argparse.Namespace:
         default="blender",
         help="Blender executable used for FBX export (default: blender)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    validate_args(parser, args)
+    return args
+
+
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.directory is not None:
+        if args.input is not None or args.output is not None:
+            parser.error("input/output positional paths cannot be used with --directory")
+        if not args.directory.is_dir():
+            parser.error(f"--directory must be an existing directory: {args.directory}")
+        return
+
+    if args.output_dir is not None:
+        parser.error("--output-dir can only be used with --directory")
+
+    if args.input is None or args.output is None:
+        parser.error("input and output are required unless --directory is used")
+
+
+def list_geojson_files(directory: Path) -> list[Path]:
+    return sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() == ".geojson"
+        ),
+        key=lambda path: path.name.lower(),
+    )
 
 
 def export_fbx_via_blender(
@@ -256,19 +295,20 @@ def export_fbx_via_blender(
         raise GeoJsonError(f"FBX export did not create a non-empty file: {filename}")
 
 
-def main() -> int:
-    args = parse_args()
-
-    height_names = parse_property_names(args.height_properties)
-    level_names = parse_property_names(args.level_properties)
-    base_height_names = parse_property_names(args.base_height_properties)
-
-    geojson = load_geojson(Path(args.input))
+def convert_geojson_to_fbx(
+    input_path: Path,
+    output_path: Path,
+    args: argparse.Namespace,
+    height_names: Sequence[str],
+    level_names: Sequence[str],
+    base_height_names: Sequence[str],
+) -> None:
+    geojson = load_geojson(input_path)
     source_crs = load_geojson_source_crs(geojson) if args.coordinates == "planar" else None
     stats = GeometryStats()
     features = list(iter_polygon_features(geojson, stats))
     if not features:
-        raise GeoJsonError("No Polygon or MultiPolygon geometry found in GeoJSON")
+        raise GeoJsonError(f"No Polygon or MultiPolygon geometry found in GeoJSON: {input_path}")
 
     source_positions = collect_positions(features)
     projector = choose_projector(
@@ -286,7 +326,7 @@ def main() -> int:
         level_names=level_names,
         base_height_names=base_height_names,
     )
-    export_fbx_via_blender(positions, normals, indices, Path(args.output), args.blender)
+    export_fbx_via_blender(positions, normals, indices, output_path, args.blender)
     print_origin_and_bounds(
         coordinates=args.coordinates,
         projector=projector,
@@ -296,13 +336,52 @@ def main() -> int:
 
     print(
         "Exported "
-        f"{args.output}: {emitted_polygon_count} polygon(s), "
+        f"{output_path}: {emitted_polygon_count} polygon(s), "
         f"{len(positions)} vertices, {len(indices) // 3} triangles."
     )
     if stats.unsupported_geometry_count:
         warn(f"Ignored {stats.unsupported_geometry_count} unsupported geometry object(s)")
     if stats.skipped_count:
         warn(f"Skipped {stats.skipped_count} invalid or degenerate polygon object(s)")
+
+
+def main() -> int:
+    args = parse_args()
+
+    height_names = parse_property_names(args.height_properties)
+    level_names = parse_property_names(args.level_properties)
+    base_height_names = parse_property_names(args.base_height_properties)
+
+    if args.directory is not None:
+        input_directory = args.directory
+        output_directory = args.output_dir or input_directory
+        geojson_files = list_geojson_files(input_directory)
+        if not geojson_files:
+            raise GeoJsonError(f"No .geojson files found in directory: {input_directory}")
+
+        output_directory.mkdir(parents=True, exist_ok=True)
+        for input_path in geojson_files:
+            output_path = output_directory / f"{input_path.stem}.fbx"
+            convert_geojson_to_fbx(
+                input_path=input_path,
+                output_path=output_path,
+                args=args,
+                height_names=height_names,
+                level_names=level_names,
+                base_height_names=base_height_names,
+            )
+
+        print(f"Batch exported {len(geojson_files)} file(s) from {input_directory} to {output_directory}.")
+        return 0
+
+    convert_geojson_to_fbx(
+        input_path=Path(args.input),
+        output_path=Path(args.output),
+        args=args,
+        height_names=height_names,
+        level_names=level_names,
+        base_height_names=base_height_names,
+    )
     return 0
 
 

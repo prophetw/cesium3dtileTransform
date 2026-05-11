@@ -23,6 +23,18 @@
 python3 GeoJSONToFBX/geojson_to_fbx.py input.geojson output.fbx
 ```
 
+批量转换目录下的所有 `.geojson` 文件，输出为同目录下同名 `.fbx`：
+
+```bash
+python3 GeoJSONToFBX/geojson_to_fbx.py --directory GeoJSONToFBX
+```
+
+批量转换并指定输出目录：
+
+```bash
+python3 GeoJSONToFBX/geojson_to_fbx.py --directory GeoJSONToFBX --output-dir out/fbx
+```
+
 如果输入是平面坐标：
 
 ```bash
