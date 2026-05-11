@@ -8,3 +8,4 @@ out
 *.osm
 test/
 *.geojson
+*.fbx
