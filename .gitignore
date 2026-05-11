@@ -6,3 +6,5 @@ out
 *.glb
 *.pbf
 *.osm
+test/
+*.geojson
